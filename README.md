@@ -36,21 +36,35 @@ The scripts use inline dependencies with PEP 723 script metadata. No separate in
    - `repo` (Full control of private repositories) OR `public_repo` (Access public repositories only)
 4. Copy the generated token
 
-### 2. Set Environment Variable
+### 2. Set Environment Variables
 
-**Linux/Mac:**
+**Required:**
 ```bash
-export GITHUB_TOKEN="your_token_here"
+# GitHub Personal Access Token (required)
+export GITHUB_TOKEN="your_github_token_here"
+```
+
+**Optional:**
+```bash
+# OpenAI API Key (optional - enables AI-powered recommendations)
+export OPENAI_API_KEY="your_openai_api_key_here"
+
+# OpenAI Model (optional - defaults to gpt-4o-mini)
+export OPENAI_MODEL="gpt-4o-mini"
 ```
 
 **Windows:**
 ```cmd
-set GITHUB_TOKEN=your_token_here
+set GITHUB_TOKEN=your_github_token_here
+set OPENAI_API_KEY=your_openai_api_key_here
+set OPENAI_MODEL=gpt-4o-mini
 ```
 
 **Or create a `.env` file:**
 ```
-GITHUB_TOKEN=your_token_here
+GITHUB_TOKEN=your_github_token_here
+OPENAI_API_KEY=your_openai_api_key_here
+OPENAI_MODEL=gpt-4o-mini
 ```
 
 ## Usage
@@ -117,6 +131,57 @@ uv run sync_issues.py owner repo --clear-cache
 # Clear all caches
 uv run sync_issues.py --clear-all-caches
 ```
+
+## AI-Powered Features
+
+### OpenAI Integration
+
+Several scripts include optional AI-powered features that provide enhanced analysis and recommendations:
+
+#### What OpenAI Does
+- **Cycle Time Analysis** (`cycle_time.py`): Generates intelligent recommendations for process improvements based on your data patterns
+- **Product Status Reports** (`product_status_report.py`): Creates AI-enhanced categorization and strategic summaries of work items
+- **Business Slide Generation** (`generate_business_slide.py`): Provides smart grouping and prioritization of initiatives
+
+#### How to Enable AI Features
+
+1. **Get an OpenAI API Key:**
+   - Visit [OpenAI API Platform](https://platform.openai.com/api-keys)
+   - Create an account or sign in
+   - Generate a new API key
+   - Add credits to your account (usage-based pricing)
+
+2. **Set the Environment Variable:**
+   ```bash
+   export OPENAI_API_KEY="your_openai_api_key_here"
+   ```
+
+3. **Optional Model Selection:**
+   ```bash
+   export OPENAI_MODEL="gpt-4o-mini"  # Default, cost-effective
+   # or
+   export OPENAI_MODEL="gpt-4o"       # More powerful, higher cost
+   ```
+
+#### What Happens Without OpenAI Key
+
+All scripts work perfectly without an OpenAI API key - you just get basic functionality instead of AI enhancements:
+
+- **Cycle Time Analysis**: Basic statistical analysis and visualizations (no AI recommendations)
+- **Product Status Reports**: Simple categorization based on labels (no AI-enhanced summaries)  
+- **Business Slides**: Basic grouping by labels and dates (no intelligent prioritization)
+
+You'll see informational messages like:
+```
+🤖 AI recommendations disabled. Set OPENAI_API_KEY environment variable to enable.
+```
+
+#### Privacy and Data Usage
+
+- Only issue titles, labels, and metadata are sent to OpenAI
+- No private code, comments, or sensitive data is transmitted
+- All API calls are made over HTTPS
+- OpenAI's data usage policies apply to your API requests
 
 ## Output
 
