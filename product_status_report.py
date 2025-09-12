@@ -238,7 +238,7 @@ def generate_executive_summary(categories, total_issues):
     
     return f"""**EXECUTIVE BRIEFING: PRODUCT DEVELOPMENT STATUS**
 
-This comprehensive analysis covers **{total_issues:,} strategic initiatives** currently in development across SignalWire's cloud communications platform. The work spans customer-critical issues, major product innovations, and platform infrastructure investments essential for competitive positioning and revenue growth.
+This comprehensive analysis covers **{total_issues:,} strategic initiatives** currently in development .
 
 **RESOURCE ALLOCATION STATUS:**
 - **{active_work} initiatives actively under development** (assigned engineers, work in progress)
@@ -256,6 +256,12 @@ This comprehensive analysis covers **{total_issues:,} strategic initiatives** cu
 {"🚨 **CRITICAL**: " + str(customer_planned) + " customer issues lack engineering assignment - immediate revenue risk" if customer_planned > 0 else "✅ All customer-critical issues have assigned engineering resources"}"""
 
 def main():
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Generate executive product status report from cycle time data")
+    parser.add_argument('json_file', nargs='?', default='cycle_time_report/cycle_time_data.json', 
+                       help='JSON file with issues data (default: cycle_time_report/cycle_time_data.json)')
+    args = parser.parse_args()
     
     # Load environment and setup OpenAI
     load_dotenv()
@@ -267,13 +273,34 @@ def main():
     else:
         print("⚠️  OPENAI_API_KEY not set - using basic categorization only")
     
-    # Load the data
-    if not os.path.exists('cycle_time_report/cycle_time_data.csv'):
-        print("❌ Error: cycle_time_report/cycle_time_data.csv not found")
-        print("Run 'uv run cycle_time.py owner repo' first to generate data")
+    # Load the data - try JSON first for repository metadata, fallback to CSV
+    json_data = None
+    github_owner = None
+    github_repo = None
+    
+    if os.path.exists(args.json_file):
+        import json as json_module
+        with open(args.json_file, 'r') as f:
+            json_data = json_module.load(f)
+            
+        # Check if we have the new JSON structure with metadata
+        if 'repository' in json_data and 'issues' in json_data:
+            github_owner = json_data['repository'].get('github_owner')
+            github_repo = json_data['repository'].get('github_repo')
+            # Convert issues list back to DataFrame
+            df = pd.DataFrame(json_data['issues'])
+        else:
+            # Old JSON format - direct list of issues
+            df = pd.DataFrame(json_data)
+            print("⚠️  Using legacy JSON format - GitHub URLs will be hardcoded")
+    elif os.path.exists('cycle_time_report/cycle_time_data.csv'):
+        df = pd.read_csv('cycle_time_report/cycle_time_data.csv')
+        print("⚠️  Using CSV data - GitHub URLs will need to be inferred or hardcoded")
+    else:
+        print(f"❌ Error: {args.json_file} not found")
+        print("Run 'uv run cycle_time.py <json_file>' first to generate data")
         return
     
-    df = pd.read_csv('cycle_time_report/cycle_time_data.csv')
     open_df = df[df.state == 'open'].copy()
     
     # Apply strategic work filtering (always enabled)
@@ -319,10 +346,12 @@ def main():
     
     # Generate report
     current_date = datetime.now().strftime("%B %d, %Y")
+    repo_display = f"{github_owner}/{github_repo}" if github_owner and github_repo else "signalwire/cloud-product"
+    
     report_lines = []
     report_lines.append("# Product Management Status Report - Everything Not Deployed")
     report_lines.append("")
-    report_lines.append("**Repository:** signalwire/cloud-product")
+    report_lines.append(f"**Repository:** {repo_display}")
     report_lines.append(f"**Analysis Date:** {current_date}")
     report_lines.append(f"**Total Open Issues:** {len(open_df):,}")
     report_lines.append("**Scope:** All incomplete work requiring deployment")
@@ -416,8 +445,18 @@ def main():
                 
                 report_lines.append("")
                 
-                # Add footnote
-                footnotes.append(f"[^{issue['issue_number']}]: https://github.com/signalwire/cloud-product/issues/{issue['issue_number']} - {issue['title']}")
+                # Add footnote with dynamic URL
+                if 'github_issue_url' in issue:
+                    # Use URL from JSON data
+                    issue_url = issue['github_issue_url']
+                elif github_owner and github_repo:
+                    # Generate URL from repository metadata
+                    issue_url = f"https://github.com/{github_owner}/{github_repo}/issues/{issue['issue_number']}"
+                else:
+                    # Fallback - try to infer from data or use default
+                    issue_url = f"https://github.com/signalwire/cloud-product/issues/{issue['issue_number']}"
+                
+                footnotes.append(f"[^{issue['issue_number']}]: {issue_url} - {issue['title']}")
     
     # Planned Work Section
     report_lines.append("---")
@@ -454,7 +493,16 @@ def main():
             report_lines.append(f"#### **{group_name}**")
             for issue in group_issues[:5]:  # Top 5 per group
                 report_lines.append(f"📋 **{issue['title']}**[^{issue['issue_number']}]")
-                footnotes.append(f"[^{issue['issue_number']}]: https://github.com/signalwire/cloud-product/issues/{issue['issue_number']} - {issue['title']}")
+                
+                # Add footnote with dynamic URL
+                if 'github_issue_url' in issue:
+                    issue_url = issue['github_issue_url']
+                elif github_owner and github_repo:
+                    issue_url = f"https://github.com/{github_owner}/{github_repo}/issues/{issue['issue_number']}"
+                else:
+                    issue_url = f"https://github.com/signalwire/cloud-product/issues/{issue['issue_number']}"
+                
+                footnotes.append(f"[^{issue['issue_number']}]: {issue_url} - {issue['title']}")
             report_lines.append("")
     
     # Strategic recommendations

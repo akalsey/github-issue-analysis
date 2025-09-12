@@ -1,6 +1,6 @@
 # GitHub Cycle Time Analyzer
 
-A Python tool to analyze GitHub repository issue cycle times and generate comprehensive reports with focus on strategic business value work.
+A two-step Python tool to sync GitHub repository data and analyze issue cycle times with comprehensive reports, focusing on strategic business value work.
 
 ## Prerequisites
 
@@ -10,17 +10,7 @@ A Python tool to analyze GitHub repository issue cycle times and generate compre
 
 ## Installation
 
-The script uses inline dependencies with PEP 723 script metadata. No separate installation required - just run the script with `uv` and dependencies will be automatically managed:
-
-```bash
-uv run cycle_time.py
-```
-
-Required dependencies (automatically handled):
-- requests
-- pandas  
-- matplotlib
-- seaborn
+The scripts use inline dependencies with PEP 723 script metadata. No separate installation required - just run with `uv` and dependencies will be automatically managed.
 
 ## Setup
 
@@ -52,61 +42,89 @@ GITHUB_TOKEN=your_token_here
 
 ## Usage
 
-Run the script and follow the interactive prompts:
+The analysis process has been split into two focused steps:
+
+### Step 1: Data Collection (`sync_issues.py`)
+
+First, collect GitHub data and save it to a JSON file:
 
 ```bash
-uv run cycle_time.py
+# Basic usage with interactive prompts
+uv run sync_issues.py
+
+# Direct usage with arguments  
+uv run sync_issues.py owner repo
+
+# Custom output file
+uv run sync_issues.py owner repo --output my_data.json
+
+# Include operational tasks (default excludes them)
+uv run sync_issues.py owner repo --no-strategic-filter
+
+# Sync only open issues
+uv run sync_issues.py owner repo --state open
+
+# Limit number of issues for debugging/testing
+uv run sync_issues.py owner repo --limit 100
 ```
 
-The script will ask you to enter:
-1. **Repository owner** (GitHub username or organization)
-2. **Repository name**
+This creates a comprehensive JSON file with:
+- Issue data, timeline events, commits, pull requests
+- GitHub Projects integration data
+- Strategic work filtering (excludes chores, deployments, infrastructure)
 
-### Programmatic Usage
+### Step 2: Analysis (`cycle_time.py`)
 
-```python
-from cycle_time import GitHubCycleTimeAnalyzer
-
-# Initialize
-analyzer = GitHubCycleTimeAnalyzer(
-    token="your_token", 
-    owner="username", 
-    repo="repository"
-)
-
-# Fetch and analyze
-issues = analyzer.fetch_issues(state='all')
-metrics = analyzer.calculate_cycle_times(issues)
-analyzer.generate_report(metrics)
-```
-
-### Command Line Options
+Then, analyze the collected data by specifying the JSON file created in Step 1:
 
 ```bash
-# Basic usage (interactive prompts)
-uv run cycle_time.py
+# Basic analysis (using default output file from sync step)
+uv run cycle_time.py issues_data.json
 
-# Direct usage with arguments
-uv run cycle_time.py owner repo
+# Analysis using custom JSON file
+uv run cycle_time.py my_custom_data.json
 
 # Enhanced workflow analysis with detailed output
-uv run cycle_time.py owner repo --workflow-analysis
+uv run cycle_time.py issues_data.json --workflow-analysis
 
-# Load and analyze existing data
-uv run cycle_time.py owner repo --load-json cycle_time_report/cycle_time_data.json
+# Fast mode (skip work start detection)
+uv run cycle_time.py issues_data.json --fast
+```
 
-# Clear cached data
-uv run cycle_time.py owner repo --clear-cache
+**Note**: The JSON file argument is required - it should be the file created by `sync_issues.py` in Step 1.
+
+### Cache Management
+
+The sync script includes intelligent caching to speed up subsequent runs:
+
+```bash
+# Clear cache for specific repository
+uv run sync_issues.py owner repo --clear-cache
+
+# Clear all caches
+uv run sync_issues.py --clear-all-caches
 ```
 
 ## Output
 
+### Data Collection Output (`sync_issues.py`)
+
+Creates a comprehensive JSON file (default: `issues_data.json`) containing:
+- All issue data with timeline events, commits, pull requests
+- GitHub Projects integration data  
+- Sample log file for data inspection
+- Cache files for performance
+
+### Analysis Output (`cycle_time.py`)
+
 The analyzer creates a `cycle_time_report/` directory containing:
 
 1. **`cycle_time_data.csv`** - Raw data with all metrics
-2. **`cycle_time_data.json`** - JSON format for reloading data
+2. **`cycle_time_data.json`** - JSON format with detailed analysis results
 3. **`cycle_time_analysis.png`** - Visualization charts  
 4. **`cycle_time_report.html`** - Complete HTML report
+5. **`timeline_analysis.png`** - Stage progression analysis
+6. **`workflow_analysis.png`** - GitHub Projects workflow analysis (if available)
 
 ### Sample CSV Output Structure
 ```csv
@@ -116,13 +134,30 @@ issue_number,title,created_at,closed_at,work_started_at,lead_time_days,cycle_tim
 
 ## How It Works
 
-The analyzer determines work start times using these signals:
-- Issue assignment date
-- First commit referencing the issue
-- Labels like "in progress", "in-progress", "started", "working"
+### Data Collection Process
+1. **Fetches all issues** from the specified GitHub repository
+2. **Enriches with timeline data** - events, commits, pull requests
+3. **Applies strategic filtering** to focus on business value work
+4. **Caches API responses** to avoid repeated requests
+5. **Saves comprehensive JSON** with all collected data
 
-**Lead time** = creation to closure  
-**Cycle time** = work start to closure
+### Analysis Process  
+1. **Loads data from JSON** file (no API calls needed)
+2. **Determines work start times** using multiple signals:
+   - Issue assignment date
+   - First commit referencing the issue
+   - Labels like "in progress", "in-progress", "started", "working"
+3. **Calculates metrics**:
+   - **Lead time** = creation to closure  
+   - **Cycle time** = work start to closure
+4. **Generates visualizations and reports**
+
+## Benefits of Two-Step Process
+
+- **Faster iteration**: Run analysis multiple times without re-fetching data
+- **Reduced API usage**: Avoid hitting GitHub rate limits repeatedly
+- **Better debugging**: Analyze subsets or different time periods easily
+- **Separation of concerns**: Data collection vs analysis are distinct phases
 
 ## Additional Scripts
 
@@ -170,7 +205,20 @@ uv run tests/test_enhanced_features.py
 
 ## Troubleshooting
 
+### Data Collection (`sync_issues.py`)
 1. **Rate Limiting** - Script automatically handles rate limits with delays
 2. **Authentication Errors** - Verify token has `repo` permissions and hasn't expired  
-3. **Missing Data** - Some issues may not have clear work start dates; analyzer uses heuristics
-4. **Large Repositories** - Script fetches all issues; may take time for very large repos
+3. **Large Repositories** - Data collection may take time; supports Ctrl+C to interrupt and save partial data
+4. **Cache Issues** - Use `--clear-cache` if you need fresh data
+
+### Analysis (`cycle_time.py`)  
+1. **Missing JSON File** - Run `sync_issues.py` first to collect data
+2. **Missing Data** - Some issues may not have clear work start dates; analyzer uses heuristics
+3. **Memory Issues** - For large datasets, use `--limit` on sync step or create smaller JSON files
+4. **Visualization Errors** - Ensure matplotlib backend is properly configured for your system
+
+### Migration from Single Script
+If you have existing workflow using the old single-script approach:
+1. Replace `uv run cycle_time.py owner repo` with the two-step process
+2. Existing JSON files from old reports may not be compatible - re-sync data with `sync_issues.py`
+3. Update any automation scripts to use the new two-step workflow

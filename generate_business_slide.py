@@ -18,10 +18,17 @@ from collections import defaultdict
 import textwrap
 import os
 
-def load_cycle_data():
+def load_cycle_data(json_file):
     """Load the cycle time data JSON"""
-    with open('cycle_time_report/cycle_time_data.json', 'r') as f:
-        return json.load(f)
+    with open(json_file, 'r') as f:
+        data = json.load(f)
+    
+    # Handle new JSON structure with metadata
+    if 'repository' in data and 'issues' in data:
+        return data['issues']
+    else:
+        # Old JSON format - direct list of issues
+        return data
 
 def is_strategic_work(issue):
     """
@@ -339,10 +346,6 @@ def create_slide(categories):
     # Header
     ax.text(2, 95, 'Product Management Status', fontsize=28, fontweight='bold', color='#2E5BBA')
     
-    # SignalWire logo area
-    logo_rect = patches.Rectangle((85, 92), 12, 6, linewidth=1, edgecolor='#2E5BBA', facecolor='none')
-    ax.add_patch(logo_rect)
-    ax.text(91, 95, 'SignalWire', fontsize=12, fontweight='bold', ha='center', va='center')
     
     # Column headers
     ax.text(5, 88, 'Last Week:', fontsize=16, fontweight='bold', color='#E91E63')
@@ -450,8 +453,20 @@ def create_slide(categories):
 
 def main():
     """Main function"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Generate business-focused product management slide from cycle time data")
+    parser.add_argument('json_file', nargs='?', default='cycle_time_report/cycle_time_data.json',
+                       help='JSON file with issues data (default: cycle_time_report/cycle_time_data.json)')
+    args = parser.parse_args()
+    
+    if not os.path.exists(args.json_file):
+        print(f"❌ Error: {args.json_file} not found")
+        print("Run 'uv run cycle_time.py <json_file>' first to generate data")
+        return
+    
     print("🔄 Loading cycle time data...")
-    data = load_cycle_data()
+    data = load_cycle_data(args.json_file)
     
     # Show date ranges being used
     now = datetime.now(timezone.utc)
