@@ -339,6 +339,18 @@ class GitHubCycleTimeAnalyzer:
         mode_text = " (fast mode - skipping work start detection)" if fast_mode else ""
         print(f"🔄 Calculating cycle times for {len(issues)} issues{mode_text}...")
         
+        # Check what data is available and inform user
+        if issues:
+            sample_issue = issues[0]
+            has_timeline = 'timeline_events' in sample_issue and sample_issue['timeline_events']
+            has_commits = 'commits' in sample_issue and sample_issue['commits']  
+            has_projects = 'project_data' in sample_issue and sample_issue['project_data']
+            
+            print(f"📊 Data availability:")
+            print(f"   {'✅' if has_timeline else '❌'} Timeline events: {'Available' if has_timeline else 'Not available (limited work start detection)'}")
+            print(f"   {'✅' if has_commits else '❌'} Commit data: {'Available' if has_commits else 'Not available (limited work start detection)'}")
+            print(f"   {'✅' if has_projects else '❌'} Project data: {'Available' if has_projects else 'Not available (basic analysis only)'}")
+        
         for i, issue in enumerate(issues):
             if i % 50 == 0:  # Show progress every 50 issues
                 progress_percent = (i / len(issues)) * 100
@@ -1642,70 +1654,8 @@ class GitHubCycleTimeAnalyzer:
             df = pd.DataFrame(df_data)
             
             
-            # Save raw data
-            df.to_csv(f"{output_dir}/cycle_time_data.csv", index=False)
-            
-            # Save JSON with full project data for complex analysis
-            import json
-            json_data = []
-            
-            # Add repository metadata to JSON
-            repo_metadata = {
-                'github_owner': self.owner,
-                'github_repo': self.repo,
-                'github_url': f'https://github.com/{self.owner}/{self.repo}',
-                'analysis_date': datetime.now().isoformat(),
-                'total_issues_analyzed': len(metrics)
-            }
-            
-            for metric in metrics:
-                # Include detailed stage segments in JSON
-                stage_segments_data = []
-                if metric.stage_segments:
-                    for seg in metric.stage_segments:
-                        stage_segments_data.append({
-                            'stage_name': seg.stage_name,
-                            'stage_type': seg.stage_type,
-                            'start_time': seg.start_time.isoformat(),
-                            'end_time': seg.end_time.isoformat(),
-                            'duration_days': seg.duration_days
-                        })
-                
-                json_item = {
-                    'issue_number': metric.issue_number,
-                    'title': metric.title,
-                    'created_at': metric.created_at.isoformat(),
-                    'closed_at': metric.closed_at.isoformat() if metric.closed_at else None,
-                    'work_started_at': metric.work_started_at.isoformat() if metric.work_started_at else None,
-                    'lead_time_days': metric.lead_time_days,
-                    'cycle_time_days': metric.cycle_time_days,
-                    'labels': metric.labels,
-                    'assignee': metric.assignee,
-                    'milestone': metric.milestone,
-                    'state': metric.state,
-                    'stage_segments': stage_segments_data,
-                    'total_work_time_days': metric.total_work_time_days,
-                    'total_wait_time_days': metric.total_wait_time_days,
-                    'work_efficiency_ratio': metric.work_efficiency_ratio,
-                    'project_title': metric.project_title,
-                    'project_status': metric.project_status,
-                    'project_iteration': metric.project_iteration,
-                    'project_assignees': metric.project_assignees,
-                    # Add GitHub repository information for URL generation
-                    'github_owner': self.owner,
-                    'github_repo': self.repo,
-                    'github_issue_url': f'https://github.com/{self.owner}/{self.repo}/issues/{metric.issue_number}'
-                }
-                json_data.append(json_item)
-            
-            # Create final JSON structure with metadata
-            final_json_data = {
-                'repository': repo_metadata,
-                'issues': json_data
-            }
-            
-            with open(f"{output_dir}/cycle_time_data.json", 'w') as f:
-                json.dump(final_json_data, f, indent=2)
+            # Note: Data files (JSON/CSV) are now created by sync_issues.py
+            # This script focuses on analysis and report generation
             
             # Generate summary statistics
             closed_issues = df[df['state'] == 'closed']
@@ -1799,7 +1749,6 @@ class GitHubCycleTimeAnalyzer:
                 f.write(html_report)
             
             print(f"\nReport generated in '{output_dir}' directory:")
-            print(f"- cycle_time_data.csv: Raw data")
             print(f"- cycle_time_analysis.png: Basic visualizations")
             print(f"- timeline_analysis.png: Stage progression timeline analysis")
             if workflow_analysis:
@@ -1999,7 +1948,7 @@ class GitHubCycleTimeAnalyzer:
     </ul>
     {f'<p><em>Recommendations generated using AI analysis of repository data.</em></p>' if os.getenv('OPENAI_API_KEY') else '<p><em>Set OPENAI_API_KEY and OPENAI_MODEL environment variables for AI-generated recommendations.</em></p>'}
     
-    <p><em>For detailed data, see cycle_time_data.csv</em></p>
+    <p><em>For detailed data, see the JSON file used as input to this analysis</em></p>
 </body>
 </html>
         """

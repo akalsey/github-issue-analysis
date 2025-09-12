@@ -132,17 +132,36 @@ Creates a comprehensive JSON file (default: `issues_data.json`) containing:
 
 The analyzer creates a `cycle_time_report/` directory containing:
 
-1. **`cycle_time_data.csv`** - Raw data with all metrics
-2. **`cycle_time_data.json`** - JSON format with detailed analysis results
-3. **`cycle_time_analysis.png`** - Visualization charts  
-4. **`cycle_time_report.html`** - Complete HTML report
-5. **`timeline_analysis.png`** - Stage progression analysis
-6. **`workflow_analysis.png`** - GitHub Projects workflow analysis (if available)
+1. **`cycle_time_analysis.png`** - Visualization charts  
+2. **`cycle_time_report.html`** - Complete HTML report
+3. **`timeline_analysis.png`** - Stage progression analysis
+4. **`workflow_analysis.png`** - GitHub Projects workflow analysis (if available)
 
-### Sample CSV Output Structure
-```csv
-issue_number,title,created_at,closed_at,work_started_at,lead_time_days,cycle_time_days,labels,assignee,milestone,state
-1,Fix login bug,2024-01-15T10:00:00,2024-01-20T15:30:00,2024-01-16T09:00:00,5.23,4.27,"bug,high-priority",john_doe,v1.2,closed
+### Sample JSON Data Structure
+The JSON file created by `sync_issues.py` contains:
+```json
+{
+  "repository": {
+    "github_owner": "owner",
+    "github_repo": "repo", 
+    "sync_date": "2024-01-15T10:00:00Z",
+    "total_issues_synced": 150
+  },
+  "issues": [
+    {
+      "number": 1,
+      "title": "Fix login bug",
+      "state": "closed", 
+      "created_at": "2024-01-15T10:00:00Z",
+      "closed_at": "2024-01-20T15:30:00Z",
+      "labels": ["bug", "high-priority"],
+      "assignee": {"login": "john_doe"},
+      "timeline_events": [...],
+      "commits": [...],
+      "project_data": [...]
+    }
+  ]
+}
 ```
 
 ## How It Works
@@ -186,9 +205,13 @@ The project includes several specialized analysis scripts:
 - Creates markdown reports with GitHub issue footnotes
 
 ```bash
+# Using default JSON file
 uv run product_status_report.py
+
+# Using specific JSON file  
+uv run product_status_report.py issues_data.json
 ```
-*Requires existing cycle time data (CSV format)*
+*Requires existing JSON data file (created by `sync_issues.py`)*
 
 **`generate_business_slide.py`**
 - Creates visual business slides for executive presentations
@@ -197,9 +220,13 @@ uv run product_status_report.py
 - Focuses on strategic initiatives and customer-impacting work
 
 ```bash
+# Using default JSON file
 uv run generate_business_slide.py
+
+# Using specific JSON file
+uv run generate_business_slide.py issues_data.json
 ```
-*Requires existing cycle time data (JSON format)*
+*Requires existing JSON data file (created by `sync_issues.py`)*
 
 ### Testing
 
@@ -223,12 +250,48 @@ uv run tests/test_enhanced_features.py
 2. **Authentication Errors** - Verify token has `repo` permissions and hasn't expired  
 3. **Large Repositories** - Data collection may take time; supports Ctrl+C to interrupt and save partial data
 4. **Cache Issues** - Use `--clear-cache` if you need fresh data
+5. **Limited Token Scopes** - Script automatically detects missing permissions and skips unavailable API calls (see Partial Data Handling below)
 
 ### Analysis (`cycle_time.py`)  
 1. **Missing JSON File** - Run `sync_issues.py` first to collect data
 2. **Missing Data** - Some issues may not have clear work start dates; analyzer uses heuristics
 3. **Memory Issues** - For large datasets, use `--limit` on sync step or create smaller JSON files
 4. **Visualization Errors** - Ensure matplotlib backend is properly configured for your system
+
+## Partial Data Handling
+
+The tools are designed to work gracefully with limited GitHub token permissions. When certain scopes are missing, the system automatically adapts:
+
+### Token Scope Detection
+The sync script automatically tests your token's capabilities and skips API calls that require unavailable permissions:
+
+- **Issues** (Required) - Basic issue data, labels, assignees, timeline events
+- **Contents** (Optional) - Commit data for work start detection 
+- **Pull Requests** (Optional) - Pull request references and links
+- **Projects** (Optional) - GitHub Projects workflow data
+
+### Degraded Functionality
+When scopes are missing, you'll see informational messages and the analysis continues with available data:
+
+**Missing Contents scope:**
+- Cannot fetch commits referencing issues
+- Work start detection relies on issue assignment and labels only
+- Cycle time analysis still works but may be less precise
+
+**Missing Pull Requests scope:**
+- Cannot fetch pull request data or links
+- Issue analysis continues normally
+
+**Missing Projects scope:**
+- Cannot fetch GitHub Projects data
+- Workflow analysis features are skipped
+- Core cycle time metrics remain available
+
+### Recommendations
+- **Fine-grained tokens**: Use minimum required scopes for your use case
+- **Public repos**: Contents scope often available by default
+- **Private repos**: May need explicit Contents permission for commit access
+- **Organizations**: Projects scope requires organization-level access
 
 ### Migration from Single Script
 If you have existing workflow using the old single-script approach:

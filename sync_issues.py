@@ -158,9 +158,13 @@ class GitHubDataSyncer:
             'Content-Type': 'application/json'
         })
         self.commit_search_available = None  # Will be tested on first use
+        self.projects_available = None  # Will be tested on first use
         self.status = StatusDisplay()
         self.interrupted = False  # Shared interrupt flag
         self.original_signal_handler = None
+        
+        # Test token capabilities on initialization
+        self.available_scopes = self._test_token_scopes()
         
         # Cache setup
         self.cache_dir = Path(f".cache/{owner}/{repo}")
@@ -180,6 +184,76 @@ class GitHubDataSyncer:
                 print(f"💾 Using cache directory: {self.cache_dir.name} ({len(cache_files)} cached files)")
             else:
                 print(f"💾 Cache directory exists but empty: {self.cache_dir.name}")
+    
+    def _test_token_scopes(self) -> Dict[str, bool]:
+        """Test what scopes/capabilities are available with current token"""
+        scopes = {
+            'issues': True,  # Assume issues are always available (basic requirement)
+            'contents': False,
+            'pull_requests': False,
+            'projects': False
+        }
+        
+        try:
+            # Test basic repo access (should work with any valid token)
+            url = f"{self.base_url}/repos/{self.owner}/{self.repo}"
+            response = self.session.get(url)
+            
+            if response.status_code == 404:
+                print(f"⚠️  Repository {self.owner}/{self.repo} not found or not accessible")
+                return scopes
+            elif response.status_code == 403:
+                print(f"⚠️  Access forbidden to {self.owner}/{self.repo} - check token permissions")
+                return scopes
+            elif response.status_code != 200:
+                print(f"⚠️  Unexpected response ({response.status_code}) testing repository access")
+                return scopes
+            
+            # Test contents scope (needed for commit search)
+            try:
+                url = f"{self.base_url}/repos/{self.owner}/{self.repo}/contents"
+                response = self.session.get(url)
+                if response.status_code in [200, 404]:  # 404 is OK (empty repo)
+                    scopes['contents'] = True
+            except:
+                pass
+            
+            # Test pull requests scope  
+            try:
+                url = f"{self.base_url}/repos/{self.owner}/{self.repo}/pulls"
+                params = {'state': 'all', 'per_page': 1}
+                response = self.session.get(url, params=params)
+                if response.status_code == 200:
+                    scopes['pull_requests'] = True
+            except:
+                pass
+            
+            # Test projects scope (GraphQL)
+            try:
+                test_query = """
+                query($owner: String!, $repo: String!) {
+                  repository(owner: $owner, name: $repo) {
+                    name
+                  }
+                }
+                """
+                result = self._make_graphql_request(test_query, {"owner": self.owner, "repo": self.repo})
+                if result and 'repository' in result:
+                    scopes['projects'] = True
+            except:
+                pass
+            
+            # Show scope status
+            print(f"🔑 Token capabilities detected:")
+            print(f"   ✅ Issues: {'Available' if scopes['issues'] else 'Not available'}")
+            print(f"   {'✅' if scopes['contents'] else '❌'} Contents: {'Available' if scopes['contents'] else 'Not available (commit search disabled)'}")
+            print(f"   {'✅' if scopes['pull_requests'] else '❌'} Pull Requests: {'Available' if scopes['pull_requests'] else 'Not available'}")
+            print(f"   {'✅' if scopes['projects'] else '❌'} Projects: {'Available' if scopes['projects'] else 'Not available'}")
+            
+        except Exception as e:
+            print(f"⚠️  Error testing token scopes: {e}")
+        
+        return scopes
         
     def _get_cache_key(self, url: str, params: Dict = None) -> str:
         """Generate a cache key for a request"""
@@ -632,6 +706,11 @@ class GitHubDataSyncer:
         if hasattr(self, '_commit_search_tested'):
             return self._commit_search_tested
         
+        # Check if contents scope is available first
+        if not self.available_scopes.get('contents', False):
+            self._commit_search_tested = False
+            return False
+        
         # Try a single, very generic search term first
         test_query = f"repo:{self.owner}/{self.repo}"
         
@@ -696,6 +775,10 @@ class GitHubDataSyncer:
     
     def fetch_pull_requests_for_issue(self, issue_number: int) -> List[Dict]:
         """Find pull requests that reference an issue"""
+        # Check if pull requests scope is available
+        if not self.available_scopes.get('pull_requests', False):
+            return []
+            
         try:
             # GitHub search for PRs mentioning the issue
             query = f"repo:{self.owner}/{self.repo} #{issue_number} type:pr"
@@ -891,6 +974,14 @@ class GitHubDataSyncer:
     
     def enrich_issues_with_project_data(self, issues: List[Dict]) -> List[Dict]:
         """Enrich issues with project board information"""
+        # Check if projects scope is available
+        if not self.available_scopes.get('projects', False):
+            self.status.print("ℹ️  Projects scope not available - skipping project data enrichment", style="blue")
+            # Return issues with empty project_data
+            for issue in issues:
+                issue['project_data'] = []
+            return issues
+            
         self.status.print("🔄 Fetching project board data...", style="cyan")
         
         # Fetch all projects (both org and repo level)
@@ -900,6 +991,9 @@ class GitHubDataSyncer:
         
         if not all_projects:
             self.status.print("⚠️  No projects found or accessible", style="yellow")
+            # Add empty project_data to all issues
+            for issue in issues:
+                issue['project_data'] = []
             return issues
             
         # Create a mapping of issue numbers to project data

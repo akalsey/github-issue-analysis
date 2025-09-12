@@ -346,7 +346,7 @@ def main():
     
     # Generate report
     current_date = datetime.now().strftime("%B %d, %Y")
-    repo_display = f"{github_owner}/{github_repo}" if github_owner and github_repo else "signalwire/cloud-product"
+    repo_display = f"{github_owner}/{github_repo}"
     
     report_lines = []
     report_lines.append("# Product Management Status Report - Everything Not Deployed")
@@ -452,9 +452,6 @@ def main():
                 elif github_owner and github_repo:
                     # Generate URL from repository metadata
                     issue_url = f"https://github.com/{github_owner}/{github_repo}/issues/{issue['issue_number']}"
-                else:
-                    # Fallback - try to infer from data or use default
-                    issue_url = f"https://github.com/signalwire/cloud-product/issues/{issue['issue_number']}"
                 
                 footnotes.append(f"[^{issue['issue_number']}]: {issue_url} - {issue['title']}")
     
@@ -497,10 +494,8 @@ def main():
                 # Add footnote with dynamic URL
                 if 'github_issue_url' in issue:
                     issue_url = issue['github_issue_url']
-                elif github_owner and github_repo:
+                else github_owner and github_repo:
                     issue_url = f"https://github.com/{github_owner}/{github_repo}/issues/{issue['issue_number']}"
-                else:
-                    issue_url = f"https://github.com/signalwire/cloud-product/issues/{issue['issue_number']}"
                 
                 footnotes.append(f"[^{issue['issue_number']}]: {issue_url} - {issue['title']}")
             report_lines.append("")
