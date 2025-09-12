@@ -16,11 +16,24 @@ The scripts use inline dependencies with PEP 723 script metadata. No separate in
 
 ### 1. Create GitHub Personal Access Token
 
+**Option A: Fine-grained personal access tokens (Recommended)**
+1. Go to GitHub Settings → Developer settings → Personal access tokens → Tokens (fine-grained)
+2. Click "Generate new token"
+3. Select the Resource Owner that matches the org containing your repo
+4. Select which Repositories you want to analyze
+5. Select scopes:
+   - Repository: `Content` - Read-only
+   - Repository: `Issues` - Read-only
+   - Repository: `Metadata` - Read-only
+   - Repository: `Pull Requests` - Read-only 
+   - Organization: `Projects` - Read-only 
+6. Copy the generated token
+
+**Option B: Classic personal access tokens (Legacy)**
 1. Go to GitHub Settings → Developer settings → Personal access tokens → Tokens (classic)
 2. Click "Generate new token"
 3. Select scopes:
-   - `repo` (Full control of private repositories)
-   - `public_repo` (Access public repositories)
+   - `repo` (Full control of private repositories) OR `public_repo` (Access public repositories only)
 4. Copy the generated token
 
 ### 2. Set Environment Variable
