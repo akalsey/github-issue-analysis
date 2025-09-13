@@ -185,12 +185,12 @@ class TestScopeDetection(unittest.TestCase):
         self.assertEqual(len(issues), 1)
         self.assertEqual(issues[0]['number'], 123)
 
-    def test_cli_use_rest_flag(self):
-        """Test --use-rest command line flag functionality"""
-        with patch('sys.argv', ['sync_issues.py', '--use-rest']):
-            sync = GitHubDataSyncer("token", "owner", "repo")
-            # Should be configured to use REST API only
-            self.assertTrue(hasattr(sync, 'force_rest_api'))
+    def test_graphql_only_operation(self):
+        """Test that the tool now operates in GraphQL-only mode"""
+        sync = GitHubDataSyncer("token", "owner", "repo")
+        # Should have GraphQL methods but no REST fallback
+        self.assertTrue(hasattr(sync, 'fetch_issues_graphql'))
+        self.assertTrue(hasattr(sync, '_make_graphql_request'))
 
     @patch('sync_issues.requests.post')
     def test_graphql_timeout_handling(self, mock_post):

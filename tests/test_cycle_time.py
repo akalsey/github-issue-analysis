@@ -65,107 +65,23 @@ class TestGitHubCycleTimeAnalyzer(unittest.TestCase):
     
     def setUp(self):
         """Set up test fixtures"""
-        self.token = "test_token"
         self.owner = "test_owner"
         self.repo = "test_repo"
-        self.analyzer = GitHubCycleTimeAnalyzer(self.token, self.owner, self.repo)
+        self.analyzer = GitHubCycleTimeAnalyzer(self.owner, self.repo)
     
     def test_analyzer_initialization(self):
         """Test analyzer is properly initialized"""
-        self.assertEqual(self.analyzer.token, self.token)
         self.assertEqual(self.analyzer.owner, self.owner)
         self.assertEqual(self.analyzer.repo, self.repo)
-        self.assertEqual(self.analyzer.base_url, "https://api.github.com")
-        self.assertIsNotNone(self.analyzer.session)
-        self.assertIn('Authorization', self.analyzer.session.headers)
-        self.assertIsNone(self.analyzer.commit_search_available)
+        # Check that the analyzer has been initialized with empty metrics list
+        self.assertEqual(self.analyzer.last_analyzed_metrics, [])
     
-    @patch('requests.Session.get')
-    def test_make_request_success(self, mock_get):
-        """Test successful API request"""
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {"test": "data"}
-        mock_get.return_value = mock_response
-        
-        result = self.analyzer._make_request("https://api.github.com/test")
-        
-        self.assertEqual(result, {"test": "data"})
-        mock_get.assert_called_once()
-    
-    @patch('time.sleep')
-    @patch('time.time')
-    @patch('requests.Session.get')
-    def test_make_request_rate_limit(self, mock_get, mock_time, mock_sleep):
-        """Test rate limit handling"""
-        # First call returns rate limit error
-        rate_limit_response = Mock()
-        rate_limit_response.status_code = 403
-        rate_limit_response.text = "rate limit exceeded"
-        rate_limit_response.headers = {'X-RateLimit-Reset': '1609459200'}
-        
-        # Second call succeeds
-        success_response = Mock()
-        success_response.status_code = 200
-        success_response.json.return_value = {"success": True}
-        
-        mock_get.side_effect = [rate_limit_response, success_response]
-        mock_time.return_value = 1609459000  # 200 seconds before reset
-        
-        result = self.analyzer._make_request("https://api.github.com/test")
-        
-        self.assertEqual(result, {"success": True})
-        mock_sleep.assert_called_once_with(201)  # 200 + 1 second buffer
-    
-    @patch('requests.Session.get')
-    def test_make_request_422_error(self, mock_get):
-        """Test 422 error handling"""
-        mock_response = Mock()
-        mock_response.status_code = 422
-        mock_response.text = "Validation Failed"
-        mock_get.return_value = mock_response
-        
-        result = self.analyzer._make_request("https://api.github.com/test")
-        
-        self.assertEqual(result, {})  # Should return empty dict for 422
-        mock_get.assert_called_once()
-    
-    @patch.object(GitHubCycleTimeAnalyzer, '_make_request')
-    def test_commit_search_capability_available(self, mock_request):
-        """Test commit search capability detection when available"""
-        mock_request.return_value = {"total_count": 0, "items": []}
-        
-        result = self.analyzer._test_commit_search_capability()
-        
-        self.assertTrue(result)
-        mock_request.assert_called_once()
-    
-    @patch.object(GitHubCycleTimeAnalyzer, '_make_request')
-    def test_commit_search_capability_unavailable(self, mock_request):
-        """Test commit search capability detection when unavailable"""
-        from requests.exceptions import HTTPError
-        
-        # Mock 422 error
-        mock_response = Mock()
-        mock_response.status_code = 422
-        
-        http_error = HTTPError()
-        http_error.response = mock_response
-        mock_request.side_effect = http_error
-        
-        result = self.analyzer._test_commit_search_capability()
-        
-        self.assertFalse(result)
-    
-    @patch.object(GitHubCycleTimeAnalyzer, '_test_commit_search_capability')
-    def test_fetch_commits_disabled(self, mock_test):
-        """Test commit fetching when search is disabled"""
-        mock_test.return_value = False
-        
-        commits = self.analyzer.fetch_commits_for_issue(123)
-        
-        self.assertEqual(commits, [])
-        self.assertFalse(self.analyzer.commit_search_available)
+    def test_analyzer_has_required_methods(self):
+        """Test that analyzer has the required methods for JSON-based analysis"""
+        self.assertTrue(hasattr(self.analyzer, 'load_cycle_data_from_json'))
+        self.assertTrue(hasattr(self.analyzer, 'calculate_cycle_times'))
+        self.assertTrue(hasattr(self.analyzer, 'generate_report'))
+        self.assertTrue(hasattr(self.analyzer, 'extract_work_start_date'))
     
     def test_sample_issue_data(self):
         """Test with sample issue data structure"""
@@ -191,75 +107,66 @@ class TestWorkStartDetection(unittest.TestCase):
     """Test work start time detection logic"""
     
     def setUp(self):
-        self.analyzer = GitHubCycleTimeAnalyzer("token", "owner", "repo")
+        self.analyzer = GitHubCycleTimeAnalyzer("owner", "repo")
     
-    @patch.object(GitHubCycleTimeAnalyzer, 'fetch_issue_events')
-    @patch.object(GitHubCycleTimeAnalyzer, 'fetch_commits_for_issue')
-    def test_extract_work_start_date_assignment(self, mock_commits, mock_events):
-        """Test work start detection via assignment"""
+    def test_extract_work_start_date_assignment(self):
+        """Test work start detection via assignment from timeline events"""
         issue = {
             "number": 1,
             "created_at": "2024-01-01T10:00:00Z",
-            "assignee": {"login": "testuser"}
+            "assignee": {"login": "testuser"},
+            "timeline_events": [
+                {
+                    "event": "assigned",
+                    "created_at": "2024-01-02T09:00:00Z"
+                }
+            ],
+            "commits": []
         }
-        
-        mock_events.return_value = [
-            {
-                "event": "assigned",
-                "created_at": "2024-01-02T09:00:00Z"
-            }
-        ]
-        mock_commits.return_value = []
         
         work_start = self.analyzer.extract_work_start_date(issue)
         
         self.assertIsNotNone(work_start)
         self.assertEqual(work_start.day, 2)
     
-    @patch.object(GitHubCycleTimeAnalyzer, 'fetch_issue_events')
-    @patch.object(GitHubCycleTimeAnalyzer, 'fetch_commits_for_issue')
-    def test_extract_work_start_date_commit(self, mock_commits, mock_events):
-        """Test work start detection via first commit"""
+    def test_extract_work_start_date_commit(self):
+        """Test work start detection via first commit from commits data"""
         issue = {
             "number": 1,
             "created_at": "2024-01-01T10:00:00Z",
-            "assignee": None
-        }
-        
-        mock_events.return_value = []
-        mock_commits.return_value = [
-            {
-                "commit": {
-                    "committer": {
-                        "date": "2024-01-03T14:00:00Z"
+            "assignee": None,
+            "timeline_events": [],
+            "commits": [
+                {
+                    "commit": {
+                        "committer": {
+                            "date": "2024-01-03T14:00:00Z"
+                        }
                     }
                 }
-            }
-        ]
+            ]
+        }
         
         work_start = self.analyzer.extract_work_start_date(issue)
         
         self.assertIsNotNone(work_start)
         self.assertEqual(work_start.day, 3)
     
-    @patch.object(GitHubCycleTimeAnalyzer, 'fetch_issue_events')
-    @patch.object(GitHubCycleTimeAnalyzer, 'fetch_commits_for_issue')
-    def test_extract_work_start_date_label(self, mock_commits, mock_events):
-        """Test work start detection via progress label"""
+    def test_extract_work_start_date_label(self):
+        """Test work start detection via progress label from timeline events"""
         issue = {
             "number": 1,
             "created_at": "2024-01-01T10:00:00Z",
-            "assignee": None
+            "assignee": None,
+            "timeline_events": [
+                {
+                    "event": "labeled",
+                    "created_at": "2024-01-01T16:00:00Z",
+                    "label": {"name": "in progress"}
+                }
+            ],
+            "commits": []
         }
-        
-        mock_events.return_value = [
-            {
-                "event": "labeled",
-                "created_at": "2024-01-01T16:00:00Z",
-                "label": {"name": "in progress"}
-            }
-        ]
-        mock_commits.return_value = []
         
         work_start = self.analyzer.extract_work_start_date(issue)
         
@@ -271,7 +178,7 @@ class TestCycleTimeCalculation(unittest.TestCase):
     """Test cycle time calculation logic"""
     
     def setUp(self):
-        self.analyzer = GitHubCycleTimeAnalyzer("token", "owner", "repo")
+        self.analyzer = GitHubCycleTimeAnalyzer("owner", "repo")
     
     def test_indentation_bug_fix(self):
         """Test that the critical indentation bug is fixed - all issues should be processed"""
@@ -357,7 +264,7 @@ class TestMonthlyCycleTrends(unittest.TestCase):
     """Test monthly cycle time trend calculation"""
     
     def setUp(self):
-        self.analyzer = GitHubCycleTimeAnalyzer("token", "owner", "repo")
+        self.analyzer = GitHubCycleTimeAnalyzer("owner", "repo")
         
         # Create sample DataFrame with closed issues across multiple months
         import pandas as pd
@@ -412,7 +319,7 @@ class TestAIRecommendations(unittest.TestCase):
     """Test AI-powered recommendations"""
     
     def setUp(self):
-        self.analyzer = GitHubCycleTimeAnalyzer("token", "owner", "repo")
+        self.analyzer = GitHubCycleTimeAnalyzer("owner", "repo")
         
         # Create sample data
         import pandas as pd
@@ -477,7 +384,7 @@ class TestReportGeneration(unittest.TestCase):
     """Test report generation functionality"""
     
     def setUp(self):
-        self.analyzer = GitHubCycleTimeAnalyzer("token", "owner", "repo")
+        self.analyzer = GitHubCycleTimeAnalyzer("owner", "repo")
         
         # Create sample metrics with timezone-aware datetimes
         from datetime import timezone

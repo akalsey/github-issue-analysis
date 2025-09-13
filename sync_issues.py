@@ -313,7 +313,7 @@ class GitHubDataSyncer:
         return scopes
         
     def _get_cache_key(self, url: str, params: Dict = None) -> str:
-        """Generate a cache key for a request"""
+        """Generate a cache key for a REST API request"""
         # Create a unique key based on URL and parameters
         # Sort params to ensure consistent key generation
         params_str = ""
@@ -322,6 +322,14 @@ class GitHubDataSyncer:
             params_str = "&".join(f"{k}={v}" for k, v in sorted_params)
         key_data = f"{url}?{params_str}"
         return hashlib.md5(key_data.encode()).hexdigest()
+    
+    def _get_graphql_cache_key(self, payload: Dict) -> str:
+        """Generate a cache key for a GraphQL request"""
+        import json
+        # Create a consistent JSON representation for caching
+        # Sort keys to ensure identical queries generate identical cache keys
+        canonical_payload = json.dumps(payload, sort_keys=True, separators=(',', ':'))
+        return hashlib.md5(canonical_payload.encode()).hexdigest()
     
     def _get_cache_file(self, cache_key: str) -> Path:
         """Get the cache file path for a given key with subdirectory structure"""
@@ -517,11 +525,8 @@ class GitHubDataSyncer:
         
         return data
     
-    def fetch_issues(self, state: str = 'all', since: Optional[str] = None, limit: Optional[int] = None) -> List[Dict]:
-        """Fetch all issues from the repository using page-based pagination"""
-        issues = []
-        sample_logged = 0
-        page = 1  # Start with page 1 for page-based pagination
+    # REST API support has been removed - this tool now only uses GraphQL API
+    # All data fetching is handled by fetch_issues_graphql() method which is much more efficient
         
         # Create sample log file
         sample_log_file = f"sample_issues_{self.owner}_{self.repo}.log"
@@ -858,14 +863,30 @@ class GitHubDataSyncer:
             payload["variables"] = variables
         
         # Check cache first for GraphQL requests
-        cache_key = self._get_cache_key(url, payload)
+        cache_key = self._get_graphql_cache_key(payload)
         cached_data = self._load_from_cache(cache_key)
         if cached_data is not None:
             # Track cache hits for statistics
             if not hasattr(self, '_cache_hit_count'):
                 self._cache_hit_count = 0
             self._cache_hit_count += 1
+            
+            # Show cache hit message (only for first few hits to avoid spam)
+            if self._cache_hit_count <= 3:
+                print(f"💾 Cache hit for GraphQL request (#{self._cache_hit_count})")
+            elif self._cache_hit_count == 4:
+                print(f"💾 Cache working well ({self._cache_hit_count} hits)... (suppressing further cache messages)")
+                
             return cached_data
+        
+        # Track cache misses for debugging
+        if not hasattr(self, '_cache_miss_count'):
+            self._cache_miss_count = 0
+        self._cache_miss_count += 1
+        
+        # Show cache miss for first few requests to help debug
+        if self._cache_miss_count <= 3:
+            print(f"🔄 Cache miss - making GraphQL request #{self._cache_miss_count}")
         
         try:
             response = self.graphql_session.post(url, json=payload)
@@ -921,6 +942,10 @@ class GitHubDataSyncer:
         # Cache successful GraphQL responses
         data = result.get("data", {})
         self._save_to_cache(cache_key, data)
+        
+        # Show cache save confirmation for debugging
+        if hasattr(self, '_cache_miss_count') and self._cache_miss_count <= 3:
+            print(f"💾 Cached GraphQL response for future use")
         
         return data
     
@@ -1598,16 +1623,11 @@ class GitHubDataSyncer:
         self.status.print(f"✅ Enriched {len([i for i in enriched_issues if i['project_data']])} issues with project data", style="green")
         return enriched_issues
     
-    def sync_issues_to_json(self, output_file: str, state: str = 'all', limit: Optional[int] = None, strategic_only: bool = True, use_rest: bool = False):
-        """Sync all GitHub issues data to a comprehensive JSON file"""
+    def sync_issues_to_json(self, output_file: str, state: str = 'all', limit: Optional[int] = None, strategic_only: bool = True):
+        """Sync all GitHub issues data to a comprehensive JSON file using GraphQL API"""
         try:
-            # Fetch issues using GraphQL by default, REST if requested
-            if use_rest:
-                self.status.print("🔄 Using REST API (legacy mode)...", style="yellow")
-                issues = self.fetch_issues(state=state, limit=limit)
-            else:
-                # Use GraphQL by default - much more efficient
-                issues = self.fetch_issues_graphql(state=state, limit=limit)
+            # Use GraphQL API - much more efficient than REST
+            issues = self.fetch_issues_graphql(state=state, limit=limit)
             
             if not issues:
                 print("No issues found in repository")
@@ -1624,66 +1644,8 @@ class GitHubDataSyncer:
                 print("No issues found after filtering")
                 return
             
-            # For REST API, we need to enrich with additional data
-            # For GraphQL API, data is already included
-            if use_rest:
-                # Enrich with GitHub Projects data
-                print("Enriching issues with GitHub Projects data...")
-                issues = self.enrich_issues_with_project_data(issues)
-                
-                # Enhance each issue with additional GitHub data
-                self.status.print("🔄 Fetching detailed issue data...", style="cyan")
-                self._setup_interrupt_handler()
-                
-                try:
-                    enhanced_issues = []
-                    for i, issue in enumerate(issues):
-                        # Check for interrupt every 10 issues
-                        if i % 10 == 0:
-                            self._check_interrupted()
-                            progress = (i / len(issues)) * 100
-                            self.status.update(f"⚙️  Processing issue {i+1}/{len(issues)} ({progress:.1f}%) - #{issue['number']}", style="cyan")
-                        
-                        # Enhance with timeline events and commit data
-                        enhanced_issue = issue.copy()
-                        
-                        # Add timeline events (for work start detection)
-                        try:
-                            events = self.fetch_issue_events(issue['number'])
-                            enhanced_issue['timeline_events'] = events
-                        except Exception:
-                            enhanced_issue['timeline_events'] = []
-                        
-                        # Add commit data (for work start detection)
-                        try:
-                            commits = self.fetch_commits_for_issue(issue['number'])
-                            enhanced_issue['commits'] = commits
-                        except Exception:
-                            enhanced_issue['commits'] = []
-                        
-                        # Add pull request data
-                        try:
-                            prs = self.fetch_pull_requests_for_issue(issue['number'])
-                            enhanced_issue['pull_requests'] = prs
-                        except Exception:
-                            enhanced_issue['pull_requests'] = []
-                        
-                        enhanced_issues.append(enhanced_issue)
-                    
-                    issues = enhanced_issues  # Use enhanced issues
-                    
-                except InterruptedException:
-                    self.status.print(f"⚠️  User interrupted! Syncing {len(enhanced_issues)} issues processed so far...", style="yellow bold")
-                    issues = enhanced_issues  # Use what we have
-                
-                finally:
-                    self._restore_interrupt_handler()
-                    self.status.stop()
-            else:
-                # GraphQL already includes all needed data
-                self.status.print("✅ Using GraphQL - all data already included", style="green")
-            
-            # For both REST and GraphQL, issues are ready to use
+            # GraphQL already includes all needed data (timeline events, commits, project data)
+            self.status.print("✅ Using GraphQL API - comprehensive data included", style="green")
             final_issues = issues
             
             # Create final JSON structure with metadata
@@ -1741,7 +1703,6 @@ Cache Management:
     parser.add_argument('--state', choices=['open', 'closed', 'all'], default='all', help='Issue state filter (default: all)')
     parser.add_argument('--limit', type=int, help='Limit number of issues to sync (for debugging)')
     parser.add_argument('--no-strategic-filter', action='store_true', help='Include all issues, not just strategic work')
-    parser.add_argument('--use-rest', action='store_true', help='Use REST API instead of GraphQL (slower but more compatible)')
     parser.add_argument('--clear-cache', action='store_true', help='Clear cache for this repository and exit')
     parser.add_argument('--clear-all-caches', action='store_true', help='Clear all GitHub caches and exit')
     args = parser.parse_args()
@@ -1792,8 +1753,7 @@ Cache Management:
             output_file=args.output,
             state=args.state,
             limit=args.limit,
-            strategic_only=not args.no_strategic_filter,
-            use_rest=args.use_rest
+            strategic_only=not args.no_strategic_filter
         )
         
     except InterruptedException:

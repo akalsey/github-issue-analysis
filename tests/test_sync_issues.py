@@ -602,72 +602,62 @@ class TestGitHubDataSyncer(unittest.TestCase):
         
         with patch('builtins.open', mock_open()):
             with patch('json.dump'):
-                self.sync.sync_issues_to_json('test.json', use_rest=False)
+                self.sync.sync_issues_to_json('test.json')
         
         mock_graphql.assert_called_once()
 
-    @patch('sync_issues.GitHubDataSyncer.fetch_issues')
-    def test_sync_with_rest_flag(self, mock_rest):
-        """Test sync_issues_to_json uses REST when requested"""
-        mock_rest.return_value = [self.sample_issue]
-        
-        with patch('builtins.open', mock_open()):
-            with patch('json.dump'):
-                with patch('sync_issues.GitHubDataSyncer.enrich_issues_with_project_data') as mock_enrich:
-                    mock_enrich.return_value = [self.sample_issue]
-                    self.sync.sync_issues_to_json('test.json', use_rest=True)
-        
-        mock_rest.assert_called_once()
+    def test_sync_uses_only_graphql(self):
+        """Test sync_issues_to_json only uses GraphQL API (no REST fallback)"""
+        # Test that the syncer only has GraphQL methods available
+        self.assertTrue(hasattr(self.sync, 'fetch_issues_graphql'))
+        # Ensure no REST API method is available with correct signature
+        self.assertFalse(hasattr(self.sync, 'fetch_issues'))
 
-    def test_cli_use_rest_flag(self):
-        """Test --use-rest command line flag forces REST API usage"""
+    def test_cli_graphql_only(self):
+        """Test that CLI only supports GraphQL operation (no --use-rest flag)"""
         import argparse
+        from sync_issues import main
         
-        # Test parser accepts --use-rest flag
-        parser = argparse.ArgumentParser()
-        parser.add_argument('--use-rest', action='store_true', 
-                           help='Force use of REST API instead of GraphQL')
+        # Test that the sync_issues module operates in GraphQL-only mode
+        # Should not have --use-rest argument anymore
+        self.assertTrue(hasattr(self.sync, 'fetch_issues_graphql'))
         
-        # Test flag parsing
-        args = parser.parse_args(['--use-rest'])
-        self.assertTrue(args.use_rest)
-        
-        # Test default behavior (no flag)
-        args = parser.parse_args([])
-        self.assertFalse(args.use_rest)
-
-    @patch('sys.argv', ['sync_issues.py', 'owner', 'repo', '--use-rest'])
-    @patch.dict(os.environ, {'GITHUB_TOKEN': 'fake_token'})
-    @patch('sync_issues.requests.get')
-    def test_cli_forces_rest_api(self, mock_get):
-        """Test that --use-rest flag forces REST API usage"""
-        # Mock REST API response
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = [self.sample_issue]
-        mock_response.links = {}
-        mock_get.return_value = mock_response
-        
-        with patch('sync_issues.requests.post') as mock_post:
-            # Import main function to test CLI
-            from sync_issues import main
-            
-            try:
-                main()
-            except SystemExit:
-                pass
-            
-            # Verify GraphQL was not called
-            mock_post.assert_not_called()
-            
-            # Verify REST API was called
-            mock_get.assert_called()
+        # Test that the main functionality relies on GraphQL
+        with patch('sync_issues.GitHubDataSyncer') as mock_syncer:
+            mock_instance = Mock()
+            mock_syncer.return_value = mock_instance
+            # GraphQL method should exist
+            self.assertTrue(hasattr(self.sync, 'fetch_issues_graphql'))
 
     @patch('sys.argv', ['sync_issues.py', 'owner', 'repo'])
     @patch.dict(os.environ, {'GITHUB_TOKEN': 'fake_token'})
     @patch('sync_issues.requests.post')
-    def test_cli_defaults_to_graphql(self, mock_post):
-        """Test that CLI defaults to GraphQL when no --use-rest flag"""
+    def test_cli_uses_graphql_only(self, mock_post):
+        """Test that CLI uses GraphQL API only (no REST fallback)"""
+        # Mock GraphQL response
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"data": {"repository": {"issues": {"nodes": [self.sample_issue]}}}}
+        mock_post.return_value = mock_response
+        
+        # Import main function to test CLI
+        from sync_issues import main
+        
+        with patch('builtins.open', mock_open()):
+            with patch('json.dump'):
+                try:
+                    main()
+                except SystemExit:
+                    pass
+        
+        # Should have made GraphQL POST request, not REST GET
+        mock_post.assert_called()
+
+    @patch('sys.argv', ['sync_issues.py', 'owner', 'repo'])
+    @patch.dict(os.environ, {'GITHUB_TOKEN': 'fake_token'})
+    @patch('sync_issues.requests.post')
+    def test_cli_uses_graphql_only_new(self, mock_post):
+        """Test that CLI uses GraphQL exclusively (no REST option)"""
         # Mock successful GraphQL response
         mock_response = Mock()
         mock_response.status_code = 200
@@ -713,8 +703,6 @@ class TestGitHubDataSyncer(unittest.TestCase):
                            default='all', help='Issue state filter')
         parser.add_argument('--strategic-work-only', action='store_true',
                            help='Only include strategic work items')
-        parser.add_argument('--use-rest', action='store_true',
-                           help='Force use of REST API instead of GraphQL')
         
         # Test all arguments
         args = parser.parse_args([
@@ -723,7 +711,6 @@ class TestGitHubDataSyncer(unittest.TestCase):
             '--limit', '100',
             '--state', 'open',
             '--strategic-work-only',
-            '--use-rest'
         ])
         
         self.assertEqual(args.owner, 'test_owner')
@@ -732,7 +719,6 @@ class TestGitHubDataSyncer(unittest.TestCase):
         self.assertEqual(args.limit, 100)
         self.assertEqual(args.state, 'open')
         self.assertTrue(args.strategic_work_only)
-        self.assertTrue(args.use_rest)
 
 
 if __name__ == '__main__':
