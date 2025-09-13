@@ -295,18 +295,48 @@ uv run generate_business_slide.py issues_data.json
 
 ### Testing
 
-**`tests/test_cycle_time.py`**
-- Unit tests for core GitHubCycleTimeAnalyzer functionality
-- Tests cycle time calculations, work start detection, and data processing
+The project includes comprehensive test coverage across all capabilities, with each test module focused on a specific area for maintainability:
 
-**`tests/test_enhanced_features.py`**
-- Integration tests for enhanced workflow analysis features
-- Validates JSON loading, workflow visualization, and CLI options
+**Core Functionality Tests:**
+- **`test_cycle_time.py`** - Core cycle time analysis functionality, metrics calculations
+- **`test_enhanced_features.py`** - Enhanced workflow analysis features, JSON loading
+- **`test_sync_issues.py`** - GitHub data collection, API integration, pagination
 
+**Product Management Tests:**
+- **`test_product_status_report.py`** - Executive status reports, categorization, strategic summaries
+- **`test_business_slide_generation.py`** - Business presentation slides, time period analysis
+
+**Advanced Feature Tests:**
+- **`test_ai_integration.py`** - AI-powered analysis, OpenAI integration, prompt construction
+- **`test_scope_detection.py`** - Token scope detection, graceful degradation, partial data handling
+- **`test_strategic_filtering.py`** - Strategic work filtering, business value classification
+- **`test_caching_system.py`** - Caching functionality, performance optimization, cache management
+
+**Running Tests:**
 ```bash
+# Run all tests
+uv run tests/run_all_tests.py
+
+# Run specific test module
+uv run tests/run_all_tests.py test_sync_issues
+
+# List available test modules
+uv run tests/run_all_tests.py --list
+
+# Run individual test files directly
 uv run tests/test_cycle_time.py
-uv run tests/test_enhanced_features.py
+uv run tests/test_ai_integration.py
 ```
+
+**Test Coverage Areas:**
+- API integration and error handling
+- Data processing and analysis algorithms
+- AI feature integration and fallbacks
+- Token permission detection and graceful degradation  
+- Strategic work filtering and classification
+- Caching system performance and reliability
+- Executive reporting and business slide generation
+- Edge cases, error conditions, and performance scenarios
 
 ## Troubleshooting
 

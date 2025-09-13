@@ -355,91 +355,91 @@ class GitHubCycleTimeAnalyzer:
             if i % 50 == 0:  # Show progress every 50 issues
                 progress_percent = (i / len(issues)) * 100
                 print(f"⚙️  Processing issue {i+1}/{len(issues)} ({progress_percent:.1f}%) - #{issue['number']}")
-                
-                created_at = datetime.fromisoformat(issue['created_at'].replace('Z', '+00:00'))
-                closed_at = None
-                if issue['closed_at']:
-                    closed_at = datetime.fromisoformat(issue['closed_at'].replace('Z', '+00:00'))
-                
-                work_started_at = None if fast_mode else self.extract_work_start_date(issue)
-                
-                # Calculate lead time (creation to closure)
-                lead_time_days = None
-                if closed_at:
-                    lead_time_days = (closed_at - created_at).total_seconds() / (24 * 3600)
-                
-                # Calculate cycle time (work start to closure)
-                cycle_time_days = None
-                if closed_at and work_started_at:
-                    cycle_time_days = (closed_at - work_started_at).total_seconds() / (24 * 3600)
-                    # Safety check: if cycle time is negative, something went wrong - set to None
-                    if cycle_time_days < 0:
-                        cycle_time_days = None
-                
-                labels = [label['name'] for label in issue.get('labels', [])]
-                assignee = issue.get('assignee', {}).get('login') if issue.get('assignee') else None
-                milestone = issue.get('milestone', {}).get('title') if issue.get('milestone') else None
-                
-                # Analyze stage segments for closed issues
-                stage_segments = None
-                total_work_time = None
-                total_wait_time = None
-                work_efficiency_ratio = None
-                
-                if closed_at:  # Only analyze completed issues
-                    stage_segments = self.analyze_stage_segments(issue)
-                    if stage_segments:
-                        work_times = [seg.duration_days for seg in stage_segments if seg.stage_type == 'work' and seg.duration_days]
-                        wait_times = [seg.duration_days for seg in stage_segments if seg.stage_type == 'wait' and seg.duration_days]
-                        
-                        total_work_time = sum(work_times) if work_times else 0
-                        total_wait_time = sum(wait_times) if wait_times else 0
-                        
-                        if total_work_time + total_wait_time > 0:
-                            work_efficiency_ratio = total_work_time / (total_work_time + total_wait_time)
-                
-                # Extract project data if available
-                project_title = None
-                project_status = None
-                project_iteration = None
-                project_assignees = None
-                
-                project_data = issue.get('project_data', [])
-                if project_data:
-                    # Use the first project if multiple projects exist
-                    first_project = project_data[0]
-                    project_title = first_project.get('project_title')
+            
+            created_at = datetime.fromisoformat(issue['created_at'].replace('Z', '+00:00'))
+            closed_at = None
+            if issue['closed_at']:
+                closed_at = datetime.fromisoformat(issue['closed_at'].replace('Z', '+00:00'))
+            
+            work_started_at = None if fast_mode else self.extract_work_start_date(issue)
+            
+            # Calculate lead time (creation to closure)
+            lead_time_days = None
+            if closed_at:
+                lead_time_days = (closed_at - created_at).total_seconds() / (24 * 3600)
+            
+            # Calculate cycle time (work start to closure)
+            cycle_time_days = None
+            if closed_at and work_started_at:
+                cycle_time_days = (closed_at - work_started_at).total_seconds() / (24 * 3600)
+                # Safety check: if cycle time is negative, something went wrong - set to None
+                if cycle_time_days < 0:
+                    cycle_time_days = None
+            
+            labels = [label['name'] for label in issue.get('labels', [])]
+            assignee = issue.get('assignee', {}).get('login') if issue.get('assignee') else None
+            milestone = issue.get('milestone', {}).get('title') if issue.get('milestone') else None
+            
+            # Analyze stage segments for closed issues
+            stage_segments = None
+            total_work_time = None
+            total_wait_time = None
+            work_efficiency_ratio = None
+            
+            if closed_at:  # Only analyze completed issues
+                stage_segments = self.analyze_stage_segments(issue)
+                if stage_segments:
+                    work_times = [seg.duration_days for seg in stage_segments if seg.stage_type == 'work' and seg.duration_days]
+                    wait_times = [seg.duration_days for seg in stage_segments if seg.stage_type == 'wait' and seg.duration_days]
                     
-                    # Extract common field values
-                    field_values = first_project.get('field_values', {})
-                    project_status = field_values.get('Status')
-                    project_iteration = field_values.get('Iteration') or field_values.get('Sprint')
+                    total_work_time = sum(work_times) if work_times else 0
+                    total_wait_time = sum(wait_times) if wait_times else 0
                     
-                    # Try to get assignees from project data, fall back to issue assignees
-                    if 'assignees' in first_project:
-                        project_assignees = first_project['assignees']
+                    if total_work_time + total_wait_time > 0:
+                        work_efficiency_ratio = total_work_time / (total_work_time + total_wait_time)
+            
+            # Extract project data if available
+            project_title = None
+            project_status = None
+            project_iteration = None
+            project_assignees = None
+            
+            project_data = issue.get('project_data', [])
+            if project_data:
+                # Use the first project if multiple projects exist
+                first_project = project_data[0]
+                project_title = first_project.get('project_title')
                 
-                metrics.append(CycleTimeMetrics(
-                    issue_number=issue['number'],
-                    title=issue['title'],
-                    created_at=created_at,
-                    closed_at=closed_at,
-                    work_started_at=work_started_at,
-                    lead_time_days=lead_time_days,
-                    cycle_time_days=cycle_time_days,
-                    labels=labels,
-                    assignee=assignee,
-                    milestone=milestone,
-                    state=issue['state'],
-                    stage_segments=stage_segments,
-                    total_work_time_days=total_work_time,
-                    total_wait_time_days=total_wait_time,
-                    work_efficiency_ratio=work_efficiency_ratio,
-                    project_title=project_title,
-                    project_status=project_status,
-                    project_iteration=project_iteration,
-                    project_assignees=project_assignees
-                ))
+                # Extract common field values
+                field_values = first_project.get('field_values', {})
+                project_status = field_values.get('Status')
+                project_iteration = field_values.get('Iteration') or field_values.get('Sprint')
+                
+                # Try to get assignees from project data, fall back to issue assignees
+                if 'assignees' in first_project:
+                    project_assignees = first_project['assignees']
+            
+            metrics.append(CycleTimeMetrics(
+                issue_number=issue['number'],
+                title=issue['title'],
+                created_at=created_at,
+                closed_at=closed_at,
+                work_started_at=work_started_at,
+                lead_time_days=lead_time_days,
+                cycle_time_days=cycle_time_days,
+                labels=labels,
+                assignee=assignee,
+                milestone=milestone,
+                state=issue['state'],
+                stage_segments=stage_segments,
+                total_work_time_days=total_work_time,
+                total_wait_time_days=total_wait_time,
+                work_efficiency_ratio=work_efficiency_ratio,
+                project_title=project_title,
+                project_status=project_status,
+                project_iteration=project_iteration,
+                project_assignees=project_assignees
+            ))
         
         print(f"✅ Cycle time calculation complete: {len(metrics)} issues processed")
         return metrics
@@ -1111,10 +1111,6 @@ class GitHubCycleTimeAnalyzer:
         
         return 'Other'
     
-    def load_cycle_data_from_json(self, json_file_path: str) -> List[Dict]:
-        """Load cycle time data from JSON file"""
-        with open(json_file_path, 'r') as f:
-            return json.load(f)
     
     def _create_workflow_visualization(self, workflow_data: List[Dict], output_dir: str):
         """Create workflow visualization with 4 panels"""

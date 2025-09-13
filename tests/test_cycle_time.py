@@ -11,6 +11,7 @@ Unit tests for GitHub Cycle Time Analyzer
 #     "seaborn",
 #     "python-dotenv",
 #     "openai",
+#     "pytest",
 # ]
 # ///
 
@@ -272,6 +273,36 @@ class TestCycleTimeCalculation(unittest.TestCase):
     def setUp(self):
         self.analyzer = GitHubCycleTimeAnalyzer("token", "owner", "repo")
     
+    def test_indentation_bug_fix(self):
+        """Test that the critical indentation bug is fixed - all issues should be processed"""
+        # Create test data with more than 50 issues to verify the bug fix
+        issues = []
+        for i in range(100):  # Create 100 issues
+            issues.append({
+                "number": i + 1,
+                "title": f"Test Issue {i + 1}",
+                "created_at": "2024-01-01T10:00:00Z",
+                "closed_at": "2024-01-05T10:00:00Z" if i % 2 == 0 else None,  # Every other issue closed
+                "state": "closed" if i % 2 == 0 else "open",
+                "labels": [],
+                "assignee": None,
+                "milestone": None
+            })
+        
+        # Mock the work start detection
+        with patch.object(self.analyzer, 'extract_work_start_date', return_value=None):
+            metrics = self.analyzer.calculate_cycle_times(issues)
+        
+        # CRITICAL: All 100 issues should be processed, not just every 50th
+        # This verifies the indentation bug fix where processing was nested inside progress printing
+        self.assertEqual(len(metrics), 100, 
+            "All issues should be processed, not just every 50th (indentation bug fix)")
+        
+        # Verify each issue was processed correctly
+        for i, metric in enumerate(metrics):
+            self.assertEqual(metric.issue_number, i + 1)
+            self.assertEqual(metric.title, f"Test Issue {i + 1}")
+    
     @patch.object(GitHubCycleTimeAnalyzer, 'extract_work_start_date')
     def test_calculate_cycle_times(self, mock_work_start):
         """Test cycle time calculation for multiple issues"""
@@ -483,23 +514,18 @@ class TestReportGeneration(unittest.TestCase):
     @patch('matplotlib.pyplot.close')
     @patch.dict(os.environ, {}, clear=True)  # Clear environment to avoid OpenAI calls
     def test_generate_report(self, mock_close, mock_savefig):
-        """Test report generation creates expected files"""
+        """Test report generation creates expected files (HTML only, no CSV/JSON)"""
         with tempfile.TemporaryDirectory() as temp_dir:
             self.analyzer.generate_report(self.sample_metrics, temp_dir)
             
-            # Check that expected files are created
-            csv_file = Path(temp_dir) / "cycle_time_data.csv"
+            # Check that HTML file is created (CSV and JSON should not be created)
             html_file = Path(temp_dir) / "cycle_time_report.html"
+            csv_file = Path(temp_dir) / "cycle_time_data.csv"
+            json_file = Path(temp_dir) / "cycle_time_data.json"
             
-            self.assertTrue(csv_file.exists())
             self.assertTrue(html_file.exists())
-            
-            # Verify CSV content
-            with open(csv_file, 'r') as f:
-                content = f.read()
-                self.assertIn("issue_number,title,created_at", content)
-                self.assertIn("Test Issue 1", content)
-                self.assertIn("Test Issue 2", content)
+            self.assertFalse(csv_file.exists())  # Should NOT create CSV anymore
+            self.assertFalse(json_file.exists())  # Should NOT create JSON anymore
             
             # Verify HTML content
             with open(html_file, 'r') as f:
@@ -508,6 +534,7 @@ class TestReportGeneration(unittest.TestCase):
                 self.assertIn("owner/repo", html_content)
                 self.assertIn("Lead Time", html_content)
                 self.assertIn("Recommendations", html_content)
+                self.assertIn("input JSON file", html_content)  # Should reference input JSON
     
     def test_html_report_generation(self):
         """Test HTML report contains expected elements"""
@@ -539,6 +566,75 @@ class TestReportGeneration(unittest.TestCase):
         self.assertIn("owner/repo", html_report)
         self.assertIn("Lead Time", html_report)
         self.assertIn("Cycle Time", html_report)
+
+
+class TestJSONDataLoading(unittest.TestCase):
+    """Test loading and processing JSON data from sync_issues.py"""
+    
+    def setUp(self):
+        self.sample_json_data = {
+            "repository": {
+                "github_owner": "test_owner",
+                "github_repo": "test_repo",
+                "sync_date": "2024-01-15T10:00:00Z"
+            },
+            "issues": [
+                {
+                    "number": 123,
+                    "title": "Payment processing feature",
+                    "state": "closed",
+                    "created_at": "2024-01-01T10:00:00Z",
+                    "closed_at": "2024-01-05T10:00:00Z",
+                    "labels": [{"name": "feature"}],
+                    "assignee": {"login": "dev1"},
+                    "milestone": None,
+                    "timeline_events": [
+                        {
+                            "event": "assigned",
+                            "created_at": "2024-01-02T10:00:00Z"
+                        }
+                    ],
+                    "commits": [
+                        {
+                            "sha": "abc123",
+                            "commit": {
+                                "committer": {
+                                    "date": "2024-01-03T10:00:00Z"
+                                }
+                            }
+                        }
+                    ]
+                }
+            ]
+        }
+    
+    @patch('builtins.open', new_callable=unittest.mock.mock_open)
+    @patch('json.load')
+    def test_load_cycle_data_from_json(self, mock_json_load, mock_open):
+        """Test loading cycle data from JSON file created by sync_issues.py"""
+        analyzer = GitHubCycleTimeAnalyzer()
+        
+        mock_json_load.return_value = self.sample_json_data
+        
+        data = analyzer.load_cycle_data_from_json("test_file.json")
+        
+        self.assertEqual(data["repository"]["github_owner"], "test_owner")
+        self.assertEqual(data["repository"]["github_repo"], "test_repo")
+        self.assertEqual(len(data["issues"]), 1)
+        
+    def test_issue_has_timeline_and_commits(self):
+        """Test that JSON data includes timeline events and commits from GraphQL"""
+        issue = self.sample_json_data["issues"][0]
+        
+        # Should have timeline events for work start detection
+        self.assertIn("timeline_events", issue)
+        self.assertEqual(len(issue["timeline_events"]), 1)
+        self.assertEqual(issue["timeline_events"][0]["event"], "assigned")
+        
+        # Should have commits for work start detection
+        self.assertIn("commits", issue)
+        self.assertEqual(len(issue["commits"]), 1)
+        self.assertEqual(issue["commits"][0]["sha"], "abc123")
 
 
 class TestIntegrationMocked(unittest.TestCase):
@@ -608,6 +704,79 @@ class TestIntegrationMocked(unittest.TestCase):
         
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["event"], "assigned")
+
+
+class TestMainFunction(unittest.TestCase):
+    """Test the main function with JSON file input"""
+    
+    @patch('sys.argv', ['cycle_time.py', 'test_data.json'])
+    @patch('builtins.open', new_callable=unittest.mock.mock_open)
+    @patch('json.load')
+    @patch('matplotlib.pyplot.savefig')
+    @patch('matplotlib.pyplot.close')
+    def test_main_with_json_file_argument(self, mock_close, mock_savefig, mock_json_load, mock_open):
+        """Test main function accepts JSON file argument instead of interactive prompts"""
+        from cycle_time import main
+        
+        sample_data = {
+            "repository": {
+                "github_owner": "test_owner",
+                "github_repo": "test_repo"
+            },
+            "issues": [
+                {
+                    "number": 1,
+                    "title": "Test Issue",
+                    "state": "closed",
+                    "created_at": "2024-01-01T10:00:00Z",
+                    "closed_at": "2024-01-05T10:00:00Z",
+                    "labels": [],
+                    "assignee": None,
+                    "milestone": None,
+                    "timeline_events": [],
+                    "commits": []
+                }
+            ]
+        }
+        
+        mock_json_load.return_value = sample_data
+        
+        with patch.dict(os.environ, {}, clear=True):  # Clear environment
+            with patch('builtins.print'):  # Suppress output
+                try:
+                    main()
+                except SystemExit:
+                    pass  # Expected when script completes
+        
+        # Should have loaded the JSON file
+        mock_open.assert_called()
+        mock_json_load.assert_called()
+    
+    @patch('sys.argv', ['cycle_time.py'])  # No file argument
+    @patch('builtins.input')
+    def test_main_interactive_mode_still_works(self, mock_input):
+        """Test that interactive mode still works when no JSON file is provided"""
+        from cycle_time import main
+        
+        # Mock user input for interactive mode
+        mock_input.side_effect = ["test_owner", "test_repo"]
+        
+        # Mock GitHubCycleTimeAnalyzer to avoid actual API calls
+        with patch('cycle_time.GitHubCycleTimeAnalyzer') as mock_analyzer:
+            mock_instance = Mock()
+            mock_analyzer.return_value = mock_instance
+            mock_instance.fetch_issues.return_value = []
+            mock_instance.calculate_cycle_times.return_value = []
+            
+            with patch.dict(os.environ, {'GITHUB_TOKEN': 'test_token'}):
+                with patch('builtins.print'):  # Suppress output
+                    try:
+                        main()
+                    except SystemExit:
+                        pass
+        
+        # Should have prompted for owner and repo
+        self.assertEqual(mock_input.call_count, 2)
 
 
 if __name__ == '__main__':

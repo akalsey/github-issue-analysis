@@ -40,6 +40,54 @@ class InterruptedException(Exception):
     """Exception raised when user interrupts the process"""
     pass
 
+def graphql_retry(max_retries=3, base_delay=1.0, max_delay=60.0, backoff_factor=2.0):
+    """
+    Decorator for GraphQL requests with exponential backoff retry logic
+    
+    Args:
+        max_retries: Maximum number of retry attempts
+        base_delay: Initial delay in seconds
+        max_delay: Maximum delay in seconds  
+        backoff_factor: Multiplier for exponential backoff
+    """
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            
+            for attempt in range(max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                    
+                except Exception as e:
+                    last_exception = e
+                    error_message = str(e).lower()
+                    
+                    # Don't retry on non-recoverable errors
+                    if any(err in error_message for err in [
+                        'unauthorized', 'forbidden', 'not found', 
+                        'bad credentials', 'validation failed'
+                    ]):
+                        raise e
+                    
+                    # This is the last attempt
+                    if attempt == max_retries:
+                        raise e
+                    
+                    # Calculate delay with jitter
+                    delay = min(base_delay * (backoff_factor ** attempt), max_delay)
+                    jitter = random.uniform(0.1, 0.3) * delay
+                    total_delay = delay + jitter
+                    
+                    print(f"⚠️  GraphQL request failed (attempt {attempt + 1}/{max_retries + 1}): {e}")
+                    print(f"🔄 Retrying in {total_delay:.1f} seconds...")
+                    time.sleep(total_delay)
+            
+            # This should never be reached, but just in case
+            raise last_exception
+            
+        return wrapper
+    return decorator
+
 class StatusDisplay:
     """Handle status updates with rich UI or fallback to simple print"""
     
@@ -102,7 +150,16 @@ def is_strategic_work(issue: Dict) -> bool:
     INCLUDE: product work, features, customer issues, epics
     EXCLUDE: chores, deployments, infrastructure, compliance tasks
     """
-    labels_str = str(issue.get('labels', [])).lower()
+    # Extract just the label names, not the full objects
+    labels = issue.get('labels', [])
+    if isinstance(labels, list) and labels and isinstance(labels[0], dict):
+        # GraphQL/REST format: list of label objects
+        label_names = [label.get('name', '') for label in labels]
+    else:
+        # Simple format: list of strings or other format
+        label_names = labels
+    
+    labels_str = ' '.join(label_names).lower()
     
     # INCLUDE: Strategic business value work
     include_patterns = [
@@ -163,14 +220,14 @@ class GitHubDataSyncer:
         self.interrupted = False  # Shared interrupt flag
         self.original_signal_handler = None
         
-        # Test token capabilities on initialization
-        self.available_scopes = self._test_token_scopes()
-        
-        # Cache setup
+        # Cache setup (must be before scope testing since GraphQL requests use cache)
         self.cache_dir = Path(f".cache/{owner}/{repo}")
         cache_existed = self.cache_dir.exists()
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.cache_expiry_days = 7  # 1 week
+        
+        # Test token capabilities on initialization
+        self.available_scopes = self._test_token_scopes()
         
         # Inform user about cache status
         if not cache_existed:
@@ -792,21 +849,80 @@ class GitHubDataSyncer:
             # Don't break analysis if PR search fails
             return []
     
+    @graphql_retry(max_retries=3, base_delay=2.0, max_delay=30.0)
     def _make_graphql_request(self, query: str, variables: Dict = None) -> Dict:
-        """Make a GraphQL request to GitHub API"""
+        """Make a GraphQL request to GitHub API with caching and enhanced error handling"""
         url = "https://api.github.com/graphql"
         payload = {"query": query}
         if variables:
             payload["variables"] = variables
         
-        response = self.graphql_session.post(url, json=payload)
-        response.raise_for_status()
-        result = response.json()
+        # Check cache first for GraphQL requests
+        cache_key = self._get_cache_key(url, payload)
+        cached_data = self._load_from_cache(cache_key)
+        if cached_data is not None:
+            # Track cache hits for statistics
+            if not hasattr(self, '_cache_hit_count'):
+                self._cache_hit_count = 0
+            self._cache_hit_count += 1
+            return cached_data
         
-        if "errors" in result:
-            raise Exception(f"GraphQL errors: {result['errors']}")
+        try:
+            response = self.graphql_session.post(url, json=payload)
             
-        return result.get("data", {})
+            # Handle GitHub rate limiting specifically
+            if response.status_code == 403:
+                # Check if it's a rate limit issue
+                rate_limit_remaining = response.headers.get('X-RateLimit-Remaining', '0')
+                if rate_limit_remaining == '0':
+                    reset_time = response.headers.get('X-RateLimit-Reset', '0')
+                    wait_time = max(60, int(reset_time) - int(time.time()) + 5)
+                    raise Exception(f"Rate limit exceeded. Reset in {wait_time} seconds")
+            
+            response.raise_for_status()
+            result = response.json()
+            
+            # Check for GraphQL-specific errors
+            if "errors" in result:
+                errors = result['errors']
+                
+                # Handle specific GitHub GraphQL error types
+                for error in errors:
+                    error_type = error.get('type', '')
+                    message = error.get('message', '')
+                    
+                    if 'timeout' in message.lower() or 'too complex' in message.lower():
+                        raise Exception(f"Query too complex or timeout: {message}")
+                    elif 'rate limit' in message.lower():
+                        raise Exception(f"GraphQL rate limit: {message}")
+                
+                raise Exception(f"GraphQL errors: {errors}")
+            
+            # Check rate limit status from response
+            if 'rateLimit' in result:
+                rate_limit = result['rateLimit']
+                remaining = rate_limit.get('remaining', 0)
+                if remaining < 100:  # Less than 100 points remaining
+                    reset_at = rate_limit.get('resetAt', '')
+                    print(f"⚠️  GraphQL rate limit low: {remaining} points remaining (resets at {reset_at})")
+                
+        except requests.exceptions.Timeout:
+            raise Exception("Request timeout - server took too long to respond")
+        except requests.exceptions.ConnectionError:
+            raise Exception("Connection error - unable to reach GitHub API")
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 502:
+                raise Exception("502 Bad Gateway - GitHub API temporarily unavailable")
+            elif e.response.status_code == 504:
+                raise Exception("504 Gateway Timeout - GitHub API request timed out")
+            else:
+                raise Exception(f"HTTP {e.response.status_code}: {e.response.text}")
+        
+        # Cache successful GraphQL responses
+        data = result.get("data", {})
+        self._save_to_cache(cache_key, data)
+        
+        return data
     
     def fetch_organization_projects(self) -> List[Dict]:
         """Fetch organization projects using GraphQL"""
@@ -878,7 +994,7 @@ class GitHubDataSyncer:
             query($projectId: ID!) {{
               node(id: $projectId) {{
                 ... on ProjectV2 {{
-                  items(first: 100{cursor_arg}) {{
+                  items(first: 50{cursor_arg}) {{
                     pageInfo {{
                       hasNextPage
                       endCursor
@@ -972,6 +1088,439 @@ class GitHubDataSyncer:
         
         return all_items
     
+    def _build_issues_graphql_query(self, batch_size=50) -> str:
+        """Build comprehensive GraphQL query for issues with all related data"""
+        return """
+        query GetRepositoryIssues($owner: String!, $repo: String!, $cursor: String, $first: Int, $states: [IssueState!]) {
+          repository(owner: $owner, name: $repo) {
+            issues(first: $first, after: $cursor, states: $states, orderBy: {field: CREATED_AT, direction: DESC}) {
+              pageInfo {
+                hasNextPage
+                endCursor
+              }
+              totalCount
+              nodes {
+                # Basic issue data
+                number
+                title
+                body
+                state
+                createdAt
+                updatedAt
+                closedAt
+                url
+                
+                # Labels
+                labels(first: 50) {
+                  nodes {
+                    name
+                    color
+                    description
+                  }
+                }
+                
+                # Assignment
+                assignees(first: 10) {
+                  nodes {
+                    login
+                    name
+                  }
+                }
+                
+                # Milestone
+                milestone {
+                  title
+                  description
+                  dueOn
+                  state
+                }
+                
+                # Author
+                author {
+                  login
+                  ... on User {
+                    name
+                  }
+                }
+                
+                # Timeline events (replaces fetch_issue_events)
+                timelineItems(first: 50, itemTypes: [
+                  ASSIGNED_EVENT,
+                  UNASSIGNED_EVENT, 
+                  LABELED_EVENT,
+                  UNLABELED_EVENT,
+                  CLOSED_EVENT,
+                  REOPENED_EVENT,
+                  REFERENCED_EVENT,
+                  CROSS_REFERENCED_EVENT
+                ]) {
+                  nodes {
+                    __typename
+                    ... on AssignedEvent {
+                      createdAt
+                      assignee {
+                        ... on User {
+                          login
+                        }
+                      }
+                    }
+                    ... on UnassignedEvent {
+                      createdAt
+                      assignee {
+                        ... on User {
+                          login  
+                        }
+                      }
+                    }
+                    ... on LabeledEvent {
+                      createdAt
+                      label {
+                        name
+                      }
+                    }
+                    ... on UnlabeledEvent {
+                      createdAt
+                      label {
+                        name
+                      }
+                    }
+                    ... on ClosedEvent {
+                      createdAt
+                      actor {
+                        login
+                      }
+                    }
+                    ... on ReopenedEvent {
+                      createdAt
+                      actor {
+                        login
+                      }
+                    }
+                    ... on ReferencedEvent {
+                      createdAt
+                      commit {
+                        oid
+                        message
+                        committedDate
+                        author {
+                          name
+                          email
+                        }
+                      }
+                    }
+                    ... on CrossReferencedEvent {
+                      createdAt
+                      source {
+                        ... on PullRequest {
+                          number
+                          title
+                          state
+                        }
+                      }
+                    }
+                  }
+                }
+                
+                # Project data (if available)
+                projectItems(first: 10) {
+                  nodes {
+                    id
+                    project {
+                      id
+                      title
+                      number
+                    }
+                    fieldValues(first: 20) {
+                      nodes {
+                        ... on ProjectV2ItemFieldTextValue {
+                          text
+                          field {
+                            ... on ProjectV2FieldCommon {
+                              name
+                            }
+                          }
+                        }
+                        ... on ProjectV2ItemFieldSingleSelectValue {
+                          name
+                          field {
+                            ... on ProjectV2FieldCommon {
+                              name
+                            }
+                          }
+                        }
+                        ... on ProjectV2ItemFieldDateValue {
+                          date
+                          field {
+                            ... on ProjectV2FieldCommon {
+                              name
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+                
+                # Comments count
+                comments {
+                  totalCount
+                }
+                
+                # Reactions
+                reactions {
+                  totalCount
+                }
+              }
+            }
+          }
+          
+          # Rate limit information
+          rateLimit {
+            remaining
+            resetAt
+            cost
+            limit
+          }
+        }
+        """
+    
+    def _transform_graphql_issue(self, issue_node: Dict) -> Dict:
+        """Transform GraphQL issue response to match REST API format"""
+        
+        # Extract timeline events and convert to work start detection format
+        timeline_events = []
+        commits = []
+        
+        for timeline_item in issue_node.get('timelineItems', {}).get('nodes', []):
+            event_type = timeline_item['__typename']
+            
+            if event_type == 'AssignedEvent':
+                timeline_events.append({
+                    'event': 'assigned',
+                    'created_at': timeline_item['createdAt'],
+                    'assignee': timeline_item['assignee']
+                })
+            elif event_type == 'UnassignedEvent':
+                timeline_events.append({
+                    'event': 'unassigned',
+                    'created_at': timeline_item['createdAt'],
+                    'assignee': timeline_item['assignee']
+                })
+            elif event_type == 'LabeledEvent':
+                timeline_events.append({
+                    'event': 'labeled',
+                    'created_at': timeline_item['createdAt'],
+                    'label': timeline_item['label']
+                })
+            elif event_type == 'UnlabeledEvent':
+                timeline_events.append({
+                    'event': 'unlabeled',
+                    'created_at': timeline_item['createdAt'],
+                    'label': timeline_item['label']
+                })
+            elif event_type == 'ClosedEvent':
+                timeline_events.append({
+                    'event': 'closed',
+                    'created_at': timeline_item['createdAt'],
+                    'actor': timeline_item['actor']
+                })
+            elif event_type == 'ReopenedEvent':
+                timeline_events.append({
+                    'event': 'reopened',
+                    'created_at': timeline_item['createdAt'],
+                    'actor': timeline_item['actor']
+                })
+            elif event_type == 'ReferencedEvent' and timeline_item.get('commit'):
+                commit = timeline_item['commit']
+                commits.append({
+                    'sha': commit['oid'],
+                    'commit': {
+                        'message': commit['message'],
+                        'author': {
+                            'date': commit['committedDate'],
+                            'name': commit['author']['name'],
+                            'email': commit['author']['email']
+                        }
+                    }
+                })
+        
+        # Extract project data
+        project_data = []
+        for project_item in issue_node.get('projectItems', {}).get('nodes', []):
+            project_info = {
+                'project': project_item.get('project', {}),
+                'fields': {}
+            }
+            
+            for field_value in project_item.get('fieldValues', {}).get('nodes', []):
+                # Safely get field name
+                field = field_value.get('field')
+                if not field:
+                    continue
+                    
+                field_name = field.get('name')
+                if not field_name:
+                    continue
+                
+                if 'text' in field_value:
+                    project_info['fields'][field_name] = field_value['text']
+                elif 'name' in field_value:
+                    project_info['fields'][field_name] = field_value['name']
+                elif 'date' in field_value:
+                    project_info['fields'][field_name] = field_value['date']
+                    
+            project_data.append(project_info)
+        
+        # Transform to REST API compatible format
+        issue = {
+            'number': issue_node.get('number'),
+            'title': issue_node.get('title', ''),
+            'body': issue_node.get('body') or '',
+            'state': issue_node.get('state', '').lower(),
+            'created_at': issue_node.get('createdAt'),
+            'updated_at': issue_node.get('updatedAt'),
+            'closed_at': issue_node.get('closedAt'),
+            'html_url': f"https://github.com/{self.owner}/{self.repo}/issues/{issue_node.get('number')}",
+            'url': issue_node.get('url', ''),
+            'id': issue_node.get('number'),  # Use number as ID for simplicity
+            
+            # Labels
+            'labels': [
+                {
+                    'name': label.get('name', ''),
+                    'color': label.get('color', ''),
+                    'description': label.get('description', '')
+                }
+                for label in issue_node.get('labels', {}).get('nodes', [])
+            ],
+            
+            # Assignees
+            'assignees': [
+                {'login': assignee.get('login', ''), 'name': assignee.get('name', '')}
+                for assignee in issue_node.get('assignees', {}).get('nodes', [])
+            ],
+            'assignee': None,  # Will be set below
+            
+            # Milestone
+            'milestone': issue_node.get('milestone'),
+            
+            # Author
+            'user': issue_node.get('author'),
+            
+            # Counts
+            'comments': issue_node.get('comments', {}).get('totalCount', 0),
+            
+            # Enhanced data (from GraphQL, not available in basic REST)
+            'timeline_events': timeline_events,
+            'commits': commits,
+            'project_data': project_data,
+            
+            # Additional fields for compatibility
+            'locked': False,
+            'author_association': 'NONE',
+            'pull_request': None  # This is an issue, not a PR
+        }
+        
+        # Safely set assignee
+        assignees_nodes = issue_node.get('assignees', {}).get('nodes', [])
+        if assignees_nodes:
+            issue['assignee'] = assignees_nodes[0]
+        
+        return issue
+    
+    def fetch_issues_graphql(self, state='all', limit=None, batch_size=50) -> List[Dict]:
+        """
+        Fetch issues using GraphQL - much more efficient than REST
+        
+        Benefits:
+        - Single query gets issues + timeline + projects + commits
+        - No need for separate API calls per issue
+        - Better rate limiting (points vs requests)
+        - Exact data needed, no over-fetching
+        """
+        
+        # Map REST state parameter to GraphQL states
+        state_mapping = {
+            'open': ['OPEN'],
+            'closed': ['CLOSED'], 
+            'all': ['OPEN', 'CLOSED']
+        }
+        
+        graphql_states = state_mapping.get(state, ['OPEN', 'CLOSED'])
+        
+        issues = []
+        cursor = None
+        total_fetched = 0
+        
+        # Build the query with dynamic batch size
+        query = self._build_issues_graphql_query(batch_size)
+        
+        self.status.print("🚀 Using GraphQL API for comprehensive issue fetching...", style="cyan")
+        
+        while True:
+            # Determine page size
+            page_size = 100  # GraphQL max
+            if limit and (total_fetched + page_size) > limit:
+                page_size = limit - total_fetched
+                
+            variables = {
+                "owner": self.owner,
+                "repo": self.repo,
+                "cursor": cursor,
+                "first": min(page_size, batch_size),  # Use the smaller of the two
+                "states": graphql_states
+            }
+            
+            try:
+                result = self._make_graphql_request(query, variables)
+                
+                repository = result.get('repository')
+                if not repository:
+                    raise Exception("Repository not found or not accessible")
+                
+                issues_data = repository['issues']
+                
+                # Process issues
+                for issue_node in issues_data['nodes']:
+                    # Transform GraphQL response to match REST API format
+                    issue = self._transform_graphql_issue(issue_node)
+                    issues.append(issue)
+                    
+                total_fetched += len(issues_data['nodes'])
+                
+                # Check pagination
+                page_info = issues_data['pageInfo']
+                if not page_info['hasNextPage'] or (limit and total_fetched >= limit):
+                    break
+                    
+                cursor = page_info['endCursor']
+                
+                self.status.update(f"📥 Fetched {total_fetched} issues via GraphQL (with timeline & commits)...")
+                
+            except Exception as e:
+                error_message = str(e)
+                
+                # If it's a timeout/size issue, try smaller batch sizes first
+                if "504" in error_message or "timeout" in error_message.lower() or "too large" in error_message.lower():
+                    self.status.print(f"❌ GraphQL query failed (likely too large): {e}", style="red")
+                    
+                    # Try with smaller batch size
+                    if batch_size > 25:
+                        self.status.print("🔄 Retrying GraphQL with smaller batch size (25)...", style="yellow")
+                        return self.fetch_issues_graphql(state, limit, batch_size=25)
+                    elif batch_size > 10:
+                        self.status.print("🔄 Retrying GraphQL with minimal batch size (10)...", style="yellow")
+                        return self.fetch_issues_graphql(state, limit, batch_size=10)
+                
+                # For other errors or if small batches still fail, fall back to REST
+                self.status.print(f"❌ GraphQL query failed: {e}", style="red")
+                self.status.print("🔄 Falling back to REST API (without timeline/commit data)...", style="yellow")
+                # Fall back to REST API
+                return self.fetch_issues(state, limit)
+        
+        self.status.print(f"✅ GraphQL fetch complete: {len(issues)} issues with comprehensive data", style="green")
+        return issues
+
     def enrich_issues_with_project_data(self, issues: List[Dict]) -> List[Dict]:
         """Enrich issues with project board information"""
         # Check if projects scope is available
@@ -1049,19 +1598,20 @@ class GitHubDataSyncer:
         self.status.print(f"✅ Enriched {len([i for i in enriched_issues if i['project_data']])} issues with project data", style="green")
         return enriched_issues
     
-    def sync_issues_to_json(self, output_file: str, state: str = 'all', limit: Optional[int] = None, strategic_only: bool = True):
+    def sync_issues_to_json(self, output_file: str, state: str = 'all', limit: Optional[int] = None, strategic_only: bool = True, use_rest: bool = False):
         """Sync all GitHub issues data to a comprehensive JSON file"""
         try:
-            # Fetch issues
-            issues = self.fetch_issues(state=state, limit=limit)
+            # Fetch issues using GraphQL by default, REST if requested
+            if use_rest:
+                self.status.print("🔄 Using REST API (legacy mode)...", style="yellow")
+                issues = self.fetch_issues(state=state, limit=limit)
+            else:
+                # Use GraphQL by default - much more efficient
+                issues = self.fetch_issues_graphql(state=state, limit=limit)
             
             if not issues:
                 print("No issues found in repository")
                 return
-                
-            # Enrich with GitHub Projects data
-            print("Enriching issues with GitHub Projects data...")
-            issues = self.enrich_issues_with_project_data(issues)
             
             # Apply strategic work filtering if requested
             if strategic_only:
@@ -1074,52 +1624,67 @@ class GitHubDataSyncer:
                 print("No issues found after filtering")
                 return
             
-            # Enhance each issue with additional GitHub data
-            self.status.print("🔄 Fetching detailed issue data...", style="cyan")
-            self._setup_interrupt_handler()
-            
-            try:
-                enhanced_issues = []
-                for i, issue in enumerate(issues):
-                    # Check for interrupt every 10 issues
-                    if i % 10 == 0:
-                        self._check_interrupted()
-                        progress = (i / len(issues)) * 100
-                        self.status.update(f"⚙️  Processing issue {i+1}/{len(issues)} ({progress:.1f}%) - #{issue['number']}", style="cyan")
-                    
-                    # Enhance with timeline events and commit data
-                    enhanced_issue = issue.copy()
-                    
-                    # Add timeline events (for work start detection)
-                    try:
-                        events = self.fetch_issue_events(issue['number'])
-                        enhanced_issue['timeline_events'] = events
-                    except Exception:
-                        enhanced_issue['timeline_events'] = []
-                    
-                    # Add commit data (for work start detection)
-                    try:
-                        commits = self.fetch_commits_for_issue(issue['number'])
-                        enhanced_issue['commits'] = commits
-                    except Exception:
-                        enhanced_issue['commits'] = []
-                    
-                    # Add pull request data
-                    try:
-                        prs = self.fetch_pull_requests_for_issue(issue['number'])
-                        enhanced_issue['pull_requests'] = prs
-                    except Exception:
-                        enhanced_issue['pull_requests'] = []
-                    
-                    enhanced_issues.append(enhanced_issue)
+            # For REST API, we need to enrich with additional data
+            # For GraphQL API, data is already included
+            if use_rest:
+                # Enrich with GitHub Projects data
+                print("Enriching issues with GitHub Projects data...")
+                issues = self.enrich_issues_with_project_data(issues)
                 
-            except InterruptedException:
-                self.status.print(f"⚠️  User interrupted! Syncing {len(enhanced_issues)} issues processed so far...", style="yellow bold")
-                issues = enhanced_issues  # Use what we have
+                # Enhance each issue with additional GitHub data
+                self.status.print("🔄 Fetching detailed issue data...", style="cyan")
+                self._setup_interrupt_handler()
+                
+                try:
+                    enhanced_issues = []
+                    for i, issue in enumerate(issues):
+                        # Check for interrupt every 10 issues
+                        if i % 10 == 0:
+                            self._check_interrupted()
+                            progress = (i / len(issues)) * 100
+                            self.status.update(f"⚙️  Processing issue {i+1}/{len(issues)} ({progress:.1f}%) - #{issue['number']}", style="cyan")
+                        
+                        # Enhance with timeline events and commit data
+                        enhanced_issue = issue.copy()
+                        
+                        # Add timeline events (for work start detection)
+                        try:
+                            events = self.fetch_issue_events(issue['number'])
+                            enhanced_issue['timeline_events'] = events
+                        except Exception:
+                            enhanced_issue['timeline_events'] = []
+                        
+                        # Add commit data (for work start detection)
+                        try:
+                            commits = self.fetch_commits_for_issue(issue['number'])
+                            enhanced_issue['commits'] = commits
+                        except Exception:
+                            enhanced_issue['commits'] = []
+                        
+                        # Add pull request data
+                        try:
+                            prs = self.fetch_pull_requests_for_issue(issue['number'])
+                            enhanced_issue['pull_requests'] = prs
+                        except Exception:
+                            enhanced_issue['pull_requests'] = []
+                        
+                        enhanced_issues.append(enhanced_issue)
+                    
+                    issues = enhanced_issues  # Use enhanced issues
+                    
+                except InterruptedException:
+                    self.status.print(f"⚠️  User interrupted! Syncing {len(enhanced_issues)} issues processed so far...", style="yellow bold")
+                    issues = enhanced_issues  # Use what we have
+                
+                finally:
+                    self._restore_interrupt_handler()
+                    self.status.stop()
+            else:
+                # GraphQL already includes all needed data
+                self.status.print("✅ Using GraphQL - all data already included", style="green")
             
-            finally:
-                self._restore_interrupt_handler()
-                self.status.stop()
+            # For both REST and GraphQL, issues are ready to use
+            final_issues = issues
             
             # Create final JSON structure with metadata
             json_data = {
@@ -1128,19 +1693,19 @@ class GitHubDataSyncer:
                     'github_repo': self.repo,
                     'github_url': f'https://github.com/{self.owner}/{self.repo}',
                     'sync_date': datetime.now(timezone.utc).isoformat(),
-                    'total_issues_synced': len(issues),
+                    'total_issues_synced': len(final_issues),
                     'strategic_work_filter': strategic_only,
                     'state_filter': state
                 },
-                'issues': issues
+                'issues': final_issues
             }
             
             # Write to JSON file
             with open(output_file, 'w') as f:
                 json.dump(json_data, f, indent=2, default=str)
             
-            self.status.print(f"✅ Synced {len(issues)} issues to {output_file}", style="green bold")
-            self.status.print(f"📊 Strategic work: {len(issues)} issues included", style="blue")
+            self.status.print(f"✅ Synced {len(final_issues)} issues to {output_file}", style="green bold")
+            self.status.print(f"📊 Strategic work: {len(final_issues)} issues included", style="blue")
             self.status.print(f"💾 JSON data written to: {output_file}", style="blue")
             
         except InterruptedException:
@@ -1176,6 +1741,7 @@ Cache Management:
     parser.add_argument('--state', choices=['open', 'closed', 'all'], default='all', help='Issue state filter (default: all)')
     parser.add_argument('--limit', type=int, help='Limit number of issues to sync (for debugging)')
     parser.add_argument('--no-strategic-filter', action='store_true', help='Include all issues, not just strategic work')
+    parser.add_argument('--use-rest', action='store_true', help='Use REST API instead of GraphQL (slower but more compatible)')
     parser.add_argument('--clear-cache', action='store_true', help='Clear cache for this repository and exit')
     parser.add_argument('--clear-all-caches', action='store_true', help='Clear all GitHub caches and exit')
     args = parser.parse_args()
@@ -1226,7 +1792,8 @@ Cache Management:
             output_file=args.output,
             state=args.state,
             limit=args.limit,
-            strategic_only=not args.no_strategic_filter
+            strategic_only=not args.no_strategic_filter,
+            use_rest=args.use_rest
         )
         
     except InterruptedException:
