@@ -1,6 +1,6 @@
-# GitHub Cycle Time Analyzer
+# GitHub Project Management Suite
 
-A two-step Python tool to sync GitHub repository data and analyze issue cycle times with comprehensive reports, focusing on strategic business value work.
+A comprehensive Python toolkit for product managers and engineering leaders to analyze GitHub repositories. Provides cycle time analysis, executive status reports, business presentations, and team performance insights - all with optional AI-powered recommendations.
 
 ## Prerequisites
 
@@ -70,7 +70,7 @@ OPENAI_MODEL=gpt-4o-mini
 
 ## Usage
 
-The analysis process has been split into two focused steps:
+This toolkit provides several analysis modes for different project management needs. The core process is a two-step workflow that collects data once and enables multiple analysis types:
 
 ### Step 1: Data Collection (`sync_issues.py`)
 
@@ -103,16 +103,16 @@ This creates a comprehensive JSON file with:
 
 **Note:** Data collection uses GitHub's GraphQL API exclusively for optimal performance - typically 200x faster than REST API for large repositories with comprehensive data in a single request.
 
-### Step 2: Analysis (`cycle_time.py`)
+### Step 2: Analysis & Reporting
 
-Then, analyze the collected data by specifying the JSON file created in Step 1:
+After collecting data, choose your analysis type based on your needs:
+
+#### A. Cycle Time & Performance Analysis (`cycle_time.py`)
+For understanding team delivery patterns and process improvements:
 
 ```bash
-# Basic analysis (using default output file from sync step)
+# Basic cycle time analysis with visualizations
 uv run cycle_time.py issues_data.json
-
-# Analysis using custom JSON file
-uv run cycle_time.py my_custom_data.json
 
 # Enhanced workflow analysis with detailed output
 uv run cycle_time.py issues_data.json --workflow-analysis
@@ -121,7 +121,33 @@ uv run cycle_time.py issues_data.json --workflow-analysis
 uv run cycle_time.py issues_data.json --fast
 ```
 
-**Note**: The JSON file argument is required - it should be the file created by `sync_issues.py` in Step 1.
+**Outputs:** Statistical charts, cycle time trends, process improvement recommendations
+
+#### B. Executive Product Status (`product_status_report.py`)
+For understanding current workload and resource allocation:
+
+```bash
+# Generate executive status report
+uv run product_status_report.py issues_data.json
+
+# Focus on specific time periods or teams
+uv run product_status_report.py issues_data.json --format executive
+```
+
+**Outputs:** Markdown reports with work categorization, assignment gaps, strategic priorities
+
+#### C. Business Presentations (`generate_business_slide.py`)
+For executive presentations and sprint reviews:
+
+```bash
+# Generate business slides
+uv run generate_business_slide.py issues_data.json
+
+# Custom time periods
+uv run generate_business_slide.py issues_data.json --sprint-view
+```
+
+**Outputs:** PNG slides showing Last Week/This Week/Next 30 Days progress
 
 ### Cache Management
 
@@ -141,43 +167,55 @@ uv run sync_issues.py --clear-all-caches
 
 Several scripts include optional AI-powered features that provide enhanced analysis and recommendations:
 
-#### What OpenAI Does
-- **Cycle Time Analysis** (`cycle_time.py`): Generates intelligent recommendations for process improvements based on your data patterns
-- **Product Status Reports** (`product_status_report.py`): Creates AI-enhanced categorization and strategic summaries of work items
-- **Business Slide Generation** (`generate_business_slide.py`): Provides smart grouping and prioritization of initiatives
+#### What AI Features Provide
+
+**Enhanced Analysis & Recommendations:**
+- **Cycle Time Analysis**: AI identifies patterns in your delivery process and suggests specific improvements (e.g., "Consider implementing code review automation to reduce cycle time variance")
+- **Product Status Reports**: Intelligent categorization and executive summaries that understand business context and priorities
+- **Business Slide Generation**: Smart grouping of related work items and strategic narrative generation for executive presentations
+
+**Cost & Usage:**
+- Uses OpenAI's API with pay-per-use pricing (typically $0.01-0.10 per analysis)
+- Only sends issue titles, labels, and metadata (no private code or sensitive data)
+- Most analyses cost under $0.05 in API usage
 
 #### How to Enable AI Features
 
 1. **Get an OpenAI API Key:**
    - Visit [OpenAI API Platform](https://platform.openai.com/api-keys)
-   - Create an account or sign in
+   - Create an account and add payment method
    - Generate a new API key
-   - Add credits to your account (usage-based pricing)
+   - Minimum $5 credit recommended for regular usage
 
 2. **Set the Environment Variable:**
    ```bash
-   export OPENAI_API_KEY="your_openai_api_key_here"
+   export OPENAI_API_KEY="sk-your_api_key_here"
    ```
 
-3. **Optional Model Selection:**
+3. **Model Selection (Optional):**
    ```bash
-   export OPENAI_MODEL="gpt-4o-mini"  # Default, cost-effective
-   # or
-   export OPENAI_MODEL="gpt-4o"       # More powerful, higher cost
+   export OPENAI_MODEL="gpt-4o-mini"  # Default: Fast, cost-effective ($0.01/analysis)
+   export OPENAI_MODEL="gpt-4o"       # Premium: More insights, higher cost ($0.05/analysis)
    ```
 
-#### What Happens Without OpenAI Key
+#### Without AI Key - Full Functionality Available
 
-All scripts work perfectly without an OpenAI API key - you just get basic functionality instead of AI enhancements:
+**All core features work perfectly without OpenAI:**
+- Complete cycle time analysis with statistical insights and visualizations
+- Executive product status reports with label-based categorization
+- Business presentation slides with time-based grouping
+- Team performance metrics and trend analysis
 
-- **Cycle Time Analysis**: Basic statistical analysis and visualizations (no AI recommendations)
-- **Product Status Reports**: Simple categorization based on labels (no AI-enhanced summaries)  
-- **Business Slides**: Basic grouping by labels and dates (no intelligent prioritization)
-
-You'll see informational messages like:
+**You'll see informational messages:**
 ```
-🤖 AI recommendations disabled. Set OPENAI_API_KEY environment variable to enable.
+ℹ️  AI recommendations disabled. Set OPENAI_API_KEY for enhanced insights.
 ```
+
+**When to consider AI features:**
+- Need executive-level strategic summaries
+- Want automated process improvement recommendations
+- Require intelligent prioritization for presentations
+- Managing complex projects with nuanced business context
 
 #### Privacy and Data Usage
 
