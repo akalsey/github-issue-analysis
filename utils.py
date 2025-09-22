@@ -5,7 +5,6 @@ Contains URL generation, label handling, and issue number extraction utilities
 Used by product_status_report.py, generate_business_slide.py, and other analysis tools
 """
 
-import pandas as pd
 from typing import Dict, List, Optional, Union, Any
 
 
@@ -75,7 +74,7 @@ def format_labels_for_display(raw_labels: Union[List, str, None], separator: str
     elif isinstance(raw_labels, list):
         # List of strings
         return separator.join([str(label) for label in raw_labels])
-    elif raw_labels is not None and not pd.isna(raw_labels):
+    elif raw_labels is not None and raw_labels != '' and str(raw_labels).lower() != 'nan':
         # String or other format
         return str(raw_labels)
     else:

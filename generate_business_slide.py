@@ -21,6 +21,7 @@ import os
 # Import shared utilities
 from utils_filtering import is_strategic_work
 from utils_dates import get_week_boundaries, is_closed_last_week, is_created_last_week
+from utils import format_labels_for_display
 
 def load_cycle_data(json_file):
     """Load the cycle time data JSON"""
@@ -41,13 +42,9 @@ def translate_to_business_value(issue):
     title = issue['title']
     raw_labels = issue.get('labels', [])
     
-    # Handle both GraphQL format (labels as dicts with 'name') and REST format
-    if raw_labels and isinstance(raw_labels[0], dict):
-        # GraphQL format: [{'name': 'product/ai'}, ...]
-        labels = [label['name'] for label in raw_labels]
-    else:
-        # REST format: ['product/ai', ...]
-        labels = raw_labels
+    # Convert labels to list of strings for easier processing
+    labels_display = format_labels_for_display(raw_labels)
+    labels = labels_display.split(', ') if labels_display else []
     project_status = issue.get('project_status', '')
     
     # For critical bugs, frame as reliability improvement with specific context
@@ -104,14 +101,9 @@ def categorize_issues(data):
     
     # Product area mapping based on actual GitHub labels
     def get_product_area(issue):
-        # Handle both GraphQL format (labels as dicts with 'name') and REST format (labels as strings)
-        raw_labels = issue.get('labels', [])
-        if raw_labels and isinstance(raw_labels[0], dict):
-            # GraphQL format: [{'name': 'product/ai'}, ...]
-            labels = [label['name'].lower() for label in raw_labels]
-        else:
-            # REST format: ['product/ai', ...] or string format
-            labels = [str(label).lower() for label in raw_labels]
+        # Normalize labels using shared utility
+        labels_display = format_labels_for_display(issue.get('labels', []))
+        labels = [label.lower() for label in labels_display.split(', ') if label.strip()]
             
         title = issue['title'].lower()
         

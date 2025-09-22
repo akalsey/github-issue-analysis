@@ -57,6 +57,8 @@ from utils import (
     format_labels_for_display,
     format_status_emoji
 )
+from ai_service import AIAnalysisService
+from report_generator import ReportGenerator
 
 def display_status_bar(current, total, description, eta_seconds=None, terminal_width=None):
     """Display a progress status bar with description and optional ETA"""
@@ -189,20 +191,7 @@ class AISummaryCache:
 
 def categorize_issue(row):
     """Categorize issues by business priority and type"""
-    # Handle both GraphQL format (labels as dicts with 'name') and REST format
-    raw_labels = row.labels
-    if isinstance(raw_labels, list) and len(raw_labels) > 0:
-        if isinstance(raw_labels[0], dict):
-            # GraphQL format: [{'name': 'product/ai'}, ...]
-            labels = ' '.join([label['name'].lower() for label in raw_labels])
-        else:
-            # List of strings
-            labels = ' '.join([str(label).lower() for label in raw_labels])
-    elif raw_labels is not None and not pd.isna(raw_labels):
-        # String or other format
-        labels = str(raw_labels).lower()
-    else:
-        labels = ""
+    labels = normalize_labels(row.labels)
         
     title = str(row.title).lower()
     
@@ -264,12 +253,7 @@ def analyze_issue_with_ai(client, issue, category, cache=None):
             return cached_summary
 
     title = issue.get('title', '')
-    # Handle both GraphQL and REST label formats
-    raw_labels = issue.get('labels', [])
-    if isinstance(raw_labels, list) and raw_labels and isinstance(raw_labels[0], dict):
-        labels = ' '.join([label['name'] for label in raw_labels])
-    else:
-        labels = str(raw_labels)
+    labels = format_labels_for_display(issue.get('labels', []), ' ')
 
     assignee = issue.get('assignee', 'Unassigned')
     state = issue.get('state', 'unknown')
@@ -462,12 +446,7 @@ def generate_backlog_summary_with_ai(client, all_issues, qualifying_issues):
     for issue in sample_issues:
         title = issue.get('title', 'Untitled')
 
-        # Handle both GraphQL and REST label formats
-        raw_labels = issue.get('labels', [])
-        if isinstance(raw_labels, list) and raw_labels and isinstance(raw_labels[0], dict):
-            labels = ', '.join([label['name'] for label in raw_labels])
-        else:
-            labels = str(raw_labels) if raw_labels else 'No labels'
+        labels = format_labels_for_display(issue.get('labels', [])) or 'No labels'
 
         issue_summaries.append(f"- {title} ({labels})")
 
@@ -558,12 +537,7 @@ def group_issues_intelligently(issues, client=None):
     
     for issue in issues:
         title = issue.get('title', '').lower()
-        # Handle both GraphQL and REST label formats
-        raw_labels = issue.get('labels', [])
-        if isinstance(raw_labels, list) and raw_labels and isinstance(raw_labels[0], dict):
-            labels = ' '.join([label['name'].lower() for label in raw_labels])
-        else:
-            labels = str(raw_labels).lower()
+        labels = normalize_labels(issue.get('labels', []))
         
         # Smart grouping based on business themes
         if any(x in title for x in MAJOR_CUSTOMER_NAMES):
@@ -637,12 +611,7 @@ This comprehensive analysis covers **{total_issues:,} strategic initiatives** cu
 
 def get_issue_type_priority(issue_dict: dict) -> int:
     """Get numeric priority for sorting issues by type (lower number = higher priority)."""
-    # Handle both GraphQL and REST label formats
-    raw_labels = issue_dict.get('labels', [])
-    if isinstance(raw_labels, list) and raw_labels and isinstance(raw_labels[0], dict):
-        labels_str = ' '.join([label['name'].lower() for label in raw_labels])
-    else:
-        labels_str = str(raw_labels).lower()
+    labels_str = normalize_labels(issue_dict.get('labels', []))
 
     title = issue_dict.get('title', '').lower()
 
@@ -666,12 +635,7 @@ def get_issue_type_priority(issue_dict: dict) -> int:
 
 def get_issue_type_emoji(issue_dict: dict) -> str:
     """Determine the emoji representing the issue type."""
-    # Handle both GraphQL and REST label formats
-    raw_labels = issue_dict.get('labels', [])
-    if isinstance(raw_labels, list) and raw_labels and isinstance(raw_labels[0], dict):
-        labels_str = ' '.join([label['name'].lower() for label in raw_labels])
-    else:
-        labels_str = str(raw_labels).lower()
+    labels_str = normalize_labels(issue_dict.get('labels', []))
 
     title = issue_dict.get('title', '').lower()
 
@@ -706,18 +670,16 @@ def parse_arguments():
 
 
 def setup_environment():
-    """Setup environment and OpenAI client."""
+    """Setup environment and AI service."""
     load_dotenv()
-    openai_api_key = os.getenv('OPENAI_API_KEY')
-    client = None
+    ai_service = AIAnalysisService.create_from_api_key(cache_file=AI_SUMMARY_CACHE_FILE)
 
-    if openai_api_key:
-        client = OpenAI(api_key=openai_api_key)
+    if ai_service.is_available():
         print("🤖 OpenAI enabled for intelligent issue analysis")
     else:
         print("⚠️  OPENAI_API_KEY not set - using basic categorization only")
 
-    return client
+    return ai_service
 
 
 def load_data(json_file):
@@ -819,61 +781,22 @@ def process_issues(df):
     }
 
 
-def generate_ai_summaries(client, qualifying_issues):
+def generate_ai_summaries(ai_service, qualifying_issues):
     """Generate AI summaries for qualifying issues with caching."""
-    cache = AISummaryCache() if client else None
-
-    if not client:
+    if not ai_service.is_available():
         print("\n⚠️  OpenAI API key not set - skipping AI summaries")
         for issue in qualifying_issues:
             issue['ai_summary'] = None
         return None
 
     print(f"\n🤖 Generating AI summaries for {len(qualifying_issues)} issues...")
-    cached_count = 0
-    generated_count = 0
-    start_time = time.time()
 
-    for i, issue in enumerate(qualifying_issues):
-        issue_num = issue.get('number', issue.get('issue_number', 'unknown'))
-
-        # Calculate ETA
-        elapsed_time = time.time() - start_time
-        if i > 0:
-            avg_time_per_issue = elapsed_time / i
-            remaining_issues = len(qualifying_issues) - i
-            eta_seconds = avg_time_per_issue * remaining_issues
-        else:
-            eta_seconds = None
-
-        # Display progress with status bar including cache miss percentage
-        total_processed = cached_count + generated_count
-        cache_miss_pct = (generated_count / total_processed * 100) if total_processed > 0 else 0
-        display_status_bar(i, len(qualifying_issues), f"Generating AI summaries for issue #{issue_num} (cache miss: {cache_miss_pct:.0f}%)", eta_seconds)
-
-        # Check if we have a cached summary first
-        if cache:
-            cached_summary = cache.get_summary(issue)
-            if cached_summary:
-                issue['ai_summary'] = cached_summary
-                cached_count += 1
-                continue
-
-        # Generate new summary
-        summary = analyze_issue_with_ai(client, issue, 'executive', cache)
-        issue['ai_summary'] = summary
-        if summary:
-            generated_count += 1
-
-    # Final status bar update with final cache miss percentage
-    total_processed = cached_count + generated_count
-    cache_miss_pct = (generated_count / total_processed * 100) if total_processed > 0 else 0
-    display_status_bar(len(qualifying_issues), len(qualifying_issues), f"AI summary generation complete (cache miss: {cache_miss_pct:.0f}%)")
-    print(f"📋 Cache stats: {cached_count} cached, {generated_count} newly generated")
+    # Process issues with the AI service
+    cached_count, generated_count = ai_service.process_issues_batch(qualifying_issues, show_progress=True)
 
     # Generate backlog summary of remaining issues
     print(f"\n🎯 Generating product backlog summary...")
-    return generate_backlog_summary_with_ai(client, qualifying_issues, qualifying_issues)
+    return ai_service.generate_backlog_summary(qualifying_issues, qualifying_issues)
 
 
 def generate_executive_summary(client, issues, time_period="this period"):
@@ -1017,12 +940,7 @@ def generate_reports(qualifying_issues, all_strategic_issues, counts, client, gi
                 footnote_refs.append(f"[^{issue_num}]")
 
                 # Add footnote
-                if 'github_issue_url' in issue:
-                    issue_url = issue['github_issue_url']
-                elif github_owner and github_repo:
-                    issue_url = f"https://github.com/{github_owner}/{github_repo}/issues/{issue_num}"
-                else:
-                    issue_url = f"Issue #{issue_num}"
+                issue_url = generate_issue_url(issue, github_owner, github_repo)
 
                 footnotes.append(f"[^{issue_num}]: {issue_url} - {title}")
 
@@ -1048,12 +966,7 @@ def generate_reports(qualifying_issues, all_strategic_issues, counts, client, gi
                 footnote_refs.append(f"[^{issue_num}]")
 
                 # Add footnote
-                if 'github_issue_url' in issue:
-                    issue_url = issue['github_issue_url']
-                elif github_owner and github_repo:
-                    issue_url = f"https://github.com/{github_owner}/{github_repo}/issues/{issue_num}"
-                else:
-                    issue_url = f"Issue #{issue_num}"
+                issue_url = generate_issue_url(issue, github_owner, github_repo)
 
                 footnotes.append(f"[^{issue_num}]: {issue_url} - {title}")
 
@@ -1088,21 +1001,13 @@ def generate_reports(qualifying_issues, all_strategic_issues, counts, client, gi
             else:
                 # Fallback description
                 raw_labels = issue.get('labels', [])
-                if isinstance(raw_labels, list) and raw_labels and isinstance(raw_labels[0], dict):
-                    labels_display = ', '.join([label['name'] for label in raw_labels])
-                else:
-                    labels_display = str(raw_labels).replace(',', ', ') if raw_labels else 'No labels'
+                labels_display = format_labels_for_display(raw_labels) or 'No labels'
                 report_lines.append(f"   *Labels: {labels_display}*")
 
             report_lines.append("")
 
             # Add footnote
-            if 'github_issue_url' in issue:
-                issue_url = issue['github_issue_url']
-            elif github_owner and github_repo:
-                issue_url = f"https://github.com/{github_owner}/{github_repo}/issues/{issue_num}"
-            else:
-                issue_url = f"Issue #{issue_num}"
+            issue_url = generate_issue_url(issue, github_owner, github_repo)
 
             footnotes.append(f"[^{issue_num}]: {issue_url} - {title}")
 
@@ -1183,21 +1088,13 @@ def generate_reports(qualifying_issues, all_strategic_issues, counts, client, gi
             else:
                 # Fallback description
                 raw_labels = issue.get('labels', [])
-                if isinstance(raw_labels, list) and raw_labels and isinstance(raw_labels[0], dict):
-                    labels_display = ', '.join([label['name'] for label in raw_labels])
-                else:
-                    labels_display = str(raw_labels).replace(',', ', ') if raw_labels else 'No labels'
+                labels_display = format_labels_for_display(raw_labels) or 'No labels'
                 customer_report_lines.append(f"   *Labels: {labels_display}*")
 
             customer_report_lines.append("")
 
             # Add footnote
-            if 'github_issue_url' in issue:
-                issue_url = issue['github_issue_url']
-            elif github_owner and github_repo:
-                issue_url = f"https://github.com/{github_owner}/{github_repo}/issues/{issue_num}"
-            else:
-                issue_url = f"Issue #{issue_num}"
+            issue_url = generate_issue_url(issue, github_owner, github_repo)
 
             customer_footnotes.append(f"[^{issue_num}]: {issue_url} - {title}")
 
@@ -1218,9 +1115,50 @@ def generate_reports(qualifying_issues, all_strategic_issues, counts, client, gi
     }
 
 
+def generate_reports_with_services(qualifying_issues, all_strategic_issues, counts, ai_service, github_owner, github_repo):
+    """Generate both main and customer reports using new service modules."""
+    # Generate AI summaries first to include them in reports
+    backlog_summary = generate_ai_summaries(ai_service, qualifying_issues)
+
+    # Separate issues by category for detailed analysis
+    completed_issues = [i for i in qualifying_issues if 'recently_completed' in i['qualification_reason']]
+    scheduled_issues = [i for i in qualifying_issues if 'scheduled_next_week' in i['qualification_reason']]
+    critical_issues = [i for i in all_strategic_issues if is_critical_customer_issue(i)]
+
+    # Generate AI summaries for different periods
+    completed_summary = None
+    planned_summary = None
+    topic_groups = None
+
+    if ai_service.is_available():
+        if completed_issues:
+            print("🎯 Generating executive summary for completed work...")
+            completed_summary = ai_service.generate_executive_summary(completed_issues, "last week")
+
+        if scheduled_issues:
+            print("🎯 Generating executive summary for planned work...")
+            planned_summary = ai_service.generate_executive_summary(scheduled_issues, "this week")
+            # Get topic groups for better organization
+            topic_groups = ai_service.group_issues_by_topics(scheduled_issues)
+
+    # Create report generator
+    report_generator = ReportGenerator(github_owner, github_repo)
+
+    # Generate reports
+    return report_generator.generate_main_report(
+        qualifying_issues=qualifying_issues,
+        all_strategic_issues=all_strategic_issues,
+        counts=counts,
+        backlog_summary=backlog_summary,
+        completed_summary=completed_summary,
+        planned_summary=planned_summary,
+        topic_groups=topic_groups
+    )
+
+
 def main():
     args = parse_arguments()
-    client = setup_environment()
+    ai_service = setup_environment()
 
     # Load issue data
     try:
@@ -1239,8 +1177,8 @@ def main():
         print(e)
         return
 
-    # Generate reports
-    reports = generate_reports(qualifying_issues, all_strategic_issues, counts, client, github_owner, github_repo)
+    # Generate reports using new services
+    reports = generate_reports_with_services(qualifying_issues, all_strategic_issues, counts, ai_service, github_owner, github_repo)
 
     # Write reports to files
     os.makedirs('reports', exist_ok=True)
