@@ -19,6 +19,12 @@ A two-step Python tool that syncs GitHub repository data and analyzes issue cycl
 
 ```
 
+## Tool Use
+
+- ALWAYS run Python commands and scripts using `uv` instead of the python binary.
+- After major changes, use the code-reviewer agent to suggest refactoring plans and ask for approval
+- After functional changes, use the tester agent to create and run automated tests.
+
 ## Key Components
 
 ### Step 1: Data Collection Script (`sync_issues.py`)

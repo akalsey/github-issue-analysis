@@ -18,6 +18,10 @@ from collections import defaultdict
 import textwrap
 import os
 
+# Import shared utilities
+from utils_filtering import is_strategic_work
+from utils_dates import get_week_boundaries, is_closed_last_week, is_created_last_week
+
 def load_cycle_data(json_file):
     """Load the cycle time data JSON"""
     with open(json_file, 'r') as f:
@@ -30,53 +34,20 @@ def load_cycle_data(json_file):
         # Old JSON format - direct list of issues
         return data
 
-def is_strategic_work(issue):
-    """
-    Filter for strategic business value work vs operational maintenance.
-    Uses the same filtering logic as the cycle time reports.
-    
-    INCLUDE: product work, features, customer issues, epics
-    EXCLUDE: chores, deployments, infrastructure, compliance tasks
-    """
-    labels_str = str(issue.get('labels', [])).lower()
-    
-    # INCLUDE: Strategic business value work
-    include_patterns = [
-        'product/',      # All product work (voice, messaging, ai, video, etc.)
-        'epic',          # Major strategic initiatives
-        'area/customer', # Customer-impacting issues
-        'type/feature',  # New functionality/capabilities  
-        'type/bug',      # Customer-affecting defects
-    ]
-    
-    # EXCLUDE: Operational/maintenance work
-    exclude_patterns = [
-        'type/chore',     # Maintenance, deployments, cleanup
-        'dev/iac',        # Infrastructure as code
-        'deploy/',        # Deployment tasks
-        'compliance',     # Regulatory/security tasks
-        'tech-backlog',   # Technical debt
-        'status/',        # Workflow states, not deliverables
-        'area/internal',  # Internal tooling
-    ]
-    
-    # Check for exclusion patterns first (higher priority)
-    for pattern in exclude_patterns:
-        if pattern in labels_str:
-            return False
-    
-    # Check for inclusion patterns
-    for pattern in include_patterns:
-        if pattern in labels_str:
-            return True
-    
-    # Default: exclude unlabeled or unclear work
-    return False
+# is_strategic_work moved to utils_filtering.py
 
 def translate_to_business_value(issue):
     """Convert technical issue titles to specific, actionable business outcomes"""
     title = issue['title']
-    labels = issue.get('labels', [])
+    raw_labels = issue.get('labels', [])
+    
+    # Handle both GraphQL format (labels as dicts with 'name') and REST format
+    if raw_labels and isinstance(raw_labels[0], dict):
+        # GraphQL format: [{'name': 'product/ai'}, ...]
+        labels = [label['name'] for label in raw_labels]
+    else:
+        # REST format: ['product/ai', ...]
+        labels = raw_labels
     project_status = issue.get('project_status', '')
     
     # For critical bugs, frame as reliability improvement with specific context
@@ -115,25 +86,14 @@ def translate_to_business_value(issue):
 
 def categorize_issues(data):
     """Categorize business-relevant issues by product area and time period, aggregating into business themes"""
-    now = datetime.now(timezone.utc)
-    
-    # Calculate proper calendar weeks starting from Monday
-    # Get the current week's Monday
-    days_since_monday = now.weekday()  # Monday = 0, Sunday = 6
-    current_week_monday = now - timedelta(days=days_since_monday)
-    current_week_monday = current_week_monday.replace(hour=0, minute=0, second=0, microsecond=0)
-    
-    # Last week: Monday of previous calendar week to Sunday
-    last_week_monday = current_week_monday - timedelta(days=7)
-    last_week_sunday = current_week_monday - timedelta(days=1)
-    
-    # This week: Monday of current calendar week to Sunday  
-    this_week_monday = current_week_monday
-    this_week_sunday = current_week_monday + timedelta(days=6)
-    
-    # Next week: Monday of next calendar week to Sunday
-    next_week_monday = current_week_monday + timedelta(days=7)
-    next_week_sunday = current_week_monday + timedelta(days=13)
+    # Use shared week boundary calculation
+    boundaries = get_week_boundaries()
+    last_week_monday = boundaries['last_week_monday']
+    last_week_sunday = boundaries['last_week_sunday']
+    this_week_monday = boundaries['current_week_monday']
+    this_week_sunday = boundaries['this_week_sunday']
+    next_week_monday = boundaries['next_week_monday']
+    next_week_sunday = boundaries['next_week_sunday']
     
     # Collect raw issues first, then aggregate into themes
     raw_categories = {
@@ -144,7 +104,15 @@ def categorize_issues(data):
     
     # Product area mapping based on actual GitHub labels
     def get_product_area(issue):
-        labels = [label.lower() for label in issue.get('labels', [])]
+        # Handle both GraphQL format (labels as dicts with 'name') and REST format (labels as strings)
+        raw_labels = issue.get('labels', [])
+        if raw_labels and isinstance(raw_labels[0], dict):
+            # GraphQL format: [{'name': 'product/ai'}, ...]
+            labels = [label['name'].lower() for label in raw_labels]
+        else:
+            # REST format: ['product/ai', ...] or string format
+            labels = [str(label).lower() for label in raw_labels]
+            
         title = issue['title'].lower()
         
         # First check for explicit product/ labels
@@ -216,7 +184,7 @@ def categorize_issues(data):
             closed_date = datetime.fromisoformat(issue['closed_at'].replace('Z', '+00:00'))
         
         # Last week: Issues completed during the previous calendar week (Monday-Sunday)
-        if closed_date and last_week_monday <= closed_date <= last_week_sunday:
+        if is_closed_last_week(issue):
             raw_categories['last_week'][product_area].append(issue)
         # For remaining categories, only look at open issues
         elif issue['state'] == 'open':
@@ -293,12 +261,11 @@ Changes:
 Return only the bullet points, no additional text."""
 
     response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
+        model="gpt-5-nano",
         messages=[
             {"role": "user", "content": prompt}
         ],
-        max_tokens=500,
-        temperature=0.3
+        max_completion_tokens=500
     )
     
     summary_text = response.choices[0].message.content.strip()
@@ -468,16 +435,12 @@ def main():
     print("🔄 Loading cycle time data...")
     data = load_cycle_data(args.json_file)
     
-    # Show date ranges being used
-    now = datetime.now(timezone.utc)
-    days_since_monday = now.weekday()
-    current_week_monday = now - timedelta(days=days_since_monday)
-    current_week_monday = current_week_monday.replace(hour=0, minute=0, second=0, microsecond=0)
-    
-    last_week_monday = current_week_monday - timedelta(days=7)
-    last_week_sunday = current_week_monday - timedelta(days=1)
-    this_week_monday = current_week_monday
-    this_week_sunday = current_week_monday + timedelta(days=6)
+    # Show date ranges being used - use shared boundary calculation
+    boundaries = get_week_boundaries()
+    last_week_monday = boundaries['last_week_monday']
+    last_week_sunday = boundaries['last_week_sunday']
+    this_week_monday = boundaries['current_week_monday']
+    this_week_sunday = boundaries['this_week_sunday']
     
     print(f"📅 Date ranges being used:")
     print(f"   Last Week: {last_week_monday.strftime('%Y-%m-%d')} to {last_week_sunday.strftime('%Y-%m-%d')}")

@@ -22,7 +22,8 @@ import hashlib
 import pickle
 import signal
 import random
-from datetime import datetime, timezone
+import shutil
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 from pathlib import Path
 from dotenv import load_dotenv
@@ -40,53 +41,6 @@ class InterruptedException(Exception):
     """Exception raised when user interrupts the process"""
     pass
 
-def graphql_retry(max_retries=3, base_delay=1.0, max_delay=60.0, backoff_factor=2.0):
-    """
-    Decorator for GraphQL requests with exponential backoff retry logic
-    
-    Args:
-        max_retries: Maximum number of retry attempts
-        base_delay: Initial delay in seconds
-        max_delay: Maximum delay in seconds  
-        backoff_factor: Multiplier for exponential backoff
-    """
-    def decorator(func):
-        def wrapper(*args, **kwargs):
-            last_exception = None
-            
-            for attempt in range(max_retries + 1):
-                try:
-                    return func(*args, **kwargs)
-                    
-                except Exception as e:
-                    last_exception = e
-                    error_message = str(e).lower()
-                    
-                    # Don't retry on non-recoverable errors
-                    if any(err in error_message for err in [
-                        'unauthorized', 'forbidden', 'not found', 
-                        'bad credentials', 'validation failed'
-                    ]):
-                        raise e
-                    
-                    # This is the last attempt
-                    if attempt == max_retries:
-                        raise e
-                    
-                    # Calculate delay with jitter
-                    delay = min(base_delay * (backoff_factor ** attempt), max_delay)
-                    jitter = random.uniform(0.1, 0.3) * delay
-                    total_delay = delay + jitter
-                    
-                    print(f"⚠️  GraphQL request failed (attempt {attempt + 1}/{max_retries + 1}): {e}")
-                    print(f"🔄 Retrying in {total_delay:.1f} seconds...")
-                    time.sleep(total_delay)
-            
-            # This should never be reached, but just in case
-            raise last_exception
-            
-        return wrapper
-    return decorator
 
 class StatusDisplay:
     """Handle status updates with rich UI or fallback to simple print"""
@@ -95,6 +49,36 @@ class StatusDisplay:
         self.console = Console() if RICH_AVAILABLE else None
         self.live = None
         self.current_status = ""
+
+    def _format_status_with_eta(self, message: str, eta: str = None) -> str:
+        """Format status message with ETA on the right side, truncating left content as needed"""
+        if not eta:
+            return message
+
+        # Get terminal width, default to 80 if can't determine
+        try:
+            if RICH_AVAILABLE and self.console:
+                terminal_width = self.console.size.width
+            else:
+                terminal_width = shutil.get_terminal_size().columns
+        except:
+            terminal_width = 80
+
+        # Reserve space for ETA (add some padding)
+        eta_section = f" • {eta}"
+        reserved_space = len(eta_section) + 2  # Extra padding
+
+        # Calculate available space for main message
+        available_width = terminal_width - reserved_space
+
+        if len(message) <= available_width:
+            # Message fits, pad with spaces to push ETA to the right
+            padding = " " * (available_width - len(message))
+            return f"{message}{padding}{eta_section}"
+        else:
+            # Message is too long, truncate with ellipsis
+            truncated_message = message[:available_width - 3] + "..."
+            return f"{truncated_message}{eta_section}"
         
     def start(self, initial_message: str = "Starting..."):
         """Start the status display"""
@@ -106,15 +90,20 @@ class StatusDisplay:
         else:
             print(initial_message)
     
-    def update(self, message: str, style: str = "cyan"):
-        """Update the status message"""
-        self.current_status = message
+    def update(self, message: str, style: str = "cyan", eta: str = None):
+        """Update the status message with optional ETA"""
+        if eta:
+            formatted_message = self._format_status_with_eta(message, eta)
+        else:
+            formatted_message = message
+
+        self.current_status = formatted_message
         if self.live:
-            text = Text(message, style=style)
+            text = Text(formatted_message, style=style)
             self.live.update(text)
         else:
             # Simple fallback - overwrite the line
-            print(f"\r{message}", end="", flush=True)
+            print(f"\r{formatted_message}", end="", flush=True)
     
     def stop(self, final_message: str = None):
         """Stop the status display"""
@@ -309,8 +298,29 @@ class GitHubDataSyncer:
             
         except Exception as e:
             print(f"⚠️  Error testing token scopes: {e}")
-        
+
         return scopes
+
+    def _is_issue_fresh(self, issue: Dict, cutoff_date: datetime) -> bool:
+        """Check if an issue has been updated after the cutoff date"""
+        try:
+            # Parse the updated_at field from the issue
+            updated_at_str = issue.get('updated_at')
+            if not updated_at_str:
+                return True  # If no updated_at, include it by default
+
+            # Parse the ISO datetime string
+            updated_at = datetime.fromisoformat(updated_at_str.replace('Z', '+00:00'))
+
+            # Ensure both dates are timezone-aware for comparison
+            if updated_at.tzinfo is None:
+                updated_at = updated_at.replace(tzinfo=timezone.utc)
+
+            return updated_at > cutoff_date
+        except Exception as e:
+            # If we can't parse the date, include the issue by default
+            print(f"Warning: Could not parse updated_at for issue {issue.get('number', 'unknown')}: {e}")
+            return True
         
     def _get_cache_key(self, url: str, params: Dict = None) -> str:
         """Generate a cache key for a REST API request"""
@@ -854,7 +864,6 @@ class GitHubDataSyncer:
             # Don't break analysis if PR search fails
             return []
     
-    @graphql_retry(max_retries=3, base_delay=2.0, max_delay=30.0)
     def _make_graphql_request(self, query: str, variables: Dict = None) -> Dict:
         """Make a GraphQL request to GitHub API with caching and enhanced error handling"""
         url = "https://api.github.com/graphql"
@@ -873,9 +882,9 @@ class GitHubDataSyncer:
             
             # Show cache hit message (only for first few hits to avoid spam)
             if self._cache_hit_count <= 3:
-                print(f"💾 Cache hit for GraphQL request (#{self._cache_hit_count})")
+                self.status.update(f"💾 Cache hit for GraphQL request (#{self._cache_hit_count})", style="green")
             elif self._cache_hit_count == 4:
-                print(f"💾 Cache working well ({self._cache_hit_count} hits)... (suppressing further cache messages)")
+                self.status.update(f"💾 Cache working well ({self._cache_hit_count} hits)... (suppressing further cache messages)", style="green")
                 
             return cached_data
         
@@ -886,68 +895,105 @@ class GitHubDataSyncer:
         
         # Show cache miss for first few requests to help debug
         if self._cache_miss_count <= 3:
-            print(f"🔄 Cache miss - making GraphQL request #{self._cache_miss_count}")
-        
-        try:
-            response = self.graphql_session.post(url, json=payload)
-            
-            # Handle GitHub rate limiting specifically
-            if response.status_code == 403:
-                # Check if it's a rate limit issue
-                rate_limit_remaining = response.headers.get('X-RateLimit-Remaining', '0')
-                if rate_limit_remaining == '0':
-                    reset_time = response.headers.get('X-RateLimit-Reset', '0')
-                    wait_time = max(60, int(reset_time) - int(time.time()) + 5)
-                    raise Exception(f"Rate limit exceeded. Reset in {wait_time} seconds")
-            
-            response.raise_for_status()
-            result = response.json()
-            
-            # Check for GraphQL-specific errors
-            if "errors" in result:
-                errors = result['errors']
-                
-                # Handle specific GitHub GraphQL error types
-                for error in errors:
-                    error_type = error.get('type', '')
-                    message = error.get('message', '')
-                    
-                    if 'timeout' in message.lower() or 'too complex' in message.lower():
-                        raise Exception(f"Query too complex or timeout: {message}")
-                    elif 'rate limit' in message.lower():
-                        raise Exception(f"GraphQL rate limit: {message}")
-                
-                raise Exception(f"GraphQL errors: {errors}")
-            
-            # Check rate limit status from response
-            if 'rateLimit' in result:
-                rate_limit = result['rateLimit']
-                remaining = rate_limit.get('remaining', 0)
-                if remaining < 100:  # Less than 100 points remaining
-                    reset_at = rate_limit.get('resetAt', '')
-                    print(f"⚠️  GraphQL rate limit low: {remaining} points remaining (resets at {reset_at})")
-                
-        except requests.exceptions.Timeout:
-            raise Exception("Request timeout - server took too long to respond")
-        except requests.exceptions.ConnectionError:
-            raise Exception("Connection error - unable to reach GitHub API")
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 502:
-                raise Exception("502 Bad Gateway - GitHub API temporarily unavailable")
-            elif e.response.status_code == 504:
-                raise Exception("504 Gateway Timeout - GitHub API request timed out")
-            else:
-                raise Exception(f"HTTP {e.response.status_code}: {e.response.text}")
-        
-        # Cache successful GraphQL responses
-        data = result.get("data", {})
-        self._save_to_cache(cache_key, data)
-        
-        # Show cache save confirmation for debugging
-        if hasattr(self, '_cache_miss_count') and self._cache_miss_count <= 3:
-            print(f"💾 Cached GraphQL response for future use")
-        
-        return data
+            self.status.update(f"🔄 Cache miss - making GraphQL request #{self._cache_miss_count}", style="yellow")
+
+        # Retry logic with exponential backoff
+        max_retries = 3
+        base_delay = 2.0
+        max_delay = 30.0
+        backoff_factor = 2.0
+        last_exception = None
+
+        for attempt in range(max_retries + 1):
+            try:
+                response = self.graphql_session.post(url, json=payload)
+
+                # Handle GitHub rate limiting specifically
+                if response.status_code == 403:
+                    # Check if it's a rate limit issue
+                    rate_limit_remaining = response.headers.get('X-RateLimit-Remaining', '0')
+                    if rate_limit_remaining == '0':
+                        reset_time = response.headers.get('X-RateLimit-Reset', '0')
+                        wait_time = max(60, int(reset_time) - int(time.time()) + 5)
+                        raise Exception(f"Rate limit exceeded. Reset in {wait_time} seconds")
+
+                response.raise_for_status()
+                result = response.json()
+
+                # Check for GraphQL-specific errors
+                if "errors" in result:
+                    errors = result['errors']
+
+                    # Handle specific GitHub GraphQL error types
+                    for error in errors:
+                        error_type = error.get('type', '')
+                        message = error.get('message', '')
+
+                        if 'timeout' in message.lower() or 'too complex' in message.lower():
+                            raise Exception(f"Query too complex or timeout: {message}")
+                        elif 'rate limit' in message.lower():
+                            raise Exception(f"GraphQL rate limit: {message}")
+
+                    raise Exception(f"GraphQL errors: {errors}")
+
+                # Check rate limit status from response
+                if 'rateLimit' in result:
+                    rate_limit = result['rateLimit']
+                    remaining = rate_limit.get('remaining', 0)
+                    if remaining < 100:  # Less than 100 points remaining
+                        reset_at = rate_limit.get('resetAt', '')
+                        self.status.update(f"⚠️  GraphQL rate limit low: {remaining} points remaining (resets at {reset_at})", style="yellow")
+
+                # If we get here, the request was successful, break out of retry loop
+                # Cache successful GraphQL responses
+                data = result.get("data", {})
+                self._save_to_cache(cache_key, data)
+
+                # Show cache save confirmation for debugging
+                if hasattr(self, '_cache_miss_count') and self._cache_miss_count <= 3:
+                    self.status.update(f"💾 Cached GraphQL response for future use", style="green")
+
+                return data
+
+            except Exception as e:
+                last_exception = e
+                error_message = str(e).lower()
+
+                # Convert requests exceptions to proper exceptions for retry logic
+                if isinstance(e, requests.exceptions.Timeout):
+                    e = Exception("Request timeout - server took too long to respond")
+                elif isinstance(e, requests.exceptions.ConnectionError):
+                    e = Exception("Connection error - unable to reach GitHub API")
+                elif isinstance(e, requests.exceptions.HTTPError):
+                    if e.response.status_code == 502:
+                        e = Exception("502 Bad Gateway - GitHub API temporarily unavailable")
+                    elif e.response.status_code == 504:
+                        e = Exception("504 Gateway Timeout - GitHub API request timed out")
+                    else:
+                        e = Exception(f"HTTP {e.response.status_code}: {e.response.text}")
+
+                # Don't retry on non-recoverable errors
+                if any(err in error_message for err in [
+                    'unauthorized', 'forbidden', 'not found',
+                    'bad credentials', 'validation failed'
+                ]):
+                    raise e
+
+                # This is the last attempt
+                if attempt == max_retries:
+                    raise e
+
+                # Calculate delay with jitter
+                delay = min(base_delay * (backoff_factor ** attempt), max_delay)
+                jitter = random.uniform(0.1, 0.3) * delay
+                total_delay = delay + jitter
+
+                self.status.update(f"⚠️  GraphQL request failed (attempt {attempt + 1}/{max_retries + 1}): {e}", style="red")
+                self.status.update(f"🔄 Retrying in {total_delay:.1f} seconds...", style="yellow")
+                time.sleep(total_delay)
+
+        # This should never be reached, but just in case
+        raise last_exception
     
     def fetch_organization_projects(self) -> List[Dict]:
         """Fetch organization projects using GraphQL"""
@@ -1286,9 +1332,21 @@ class GitHubDataSyncer:
                   }
                 }
                 
-                # Comments count
-                comments {
+                # Comments (including content for customer issues and bugs)
+                comments(first: 10, orderBy: {field: UPDATED_AT, direction: DESC}) {
                   totalCount
+                  nodes {
+                    id
+                    body
+                    createdAt
+                    updatedAt
+                    author {
+                      login
+                      ... on User {
+                        name
+                      }
+                    }
+                  }
                 }
                 
                 # Reactions
@@ -1432,9 +1490,19 @@ class GitHubDataSyncer:
             # Author
             'user': issue_node.get('author'),
             
-            # Counts
+            # Counts and comment data
             'comments': issue_node.get('comments', {}).get('totalCount', 0),
-            
+            'comment_list': [
+                {
+                    'id': comment.get('id'),
+                    'body': comment.get('body', ''),
+                    'created_at': comment.get('createdAt'),
+                    'updated_at': comment.get('updatedAt'),
+                    'user': comment.get('author')
+                }
+                for comment in issue_node.get('comments', {}).get('nodes', [])
+            ],
+
             # Enhanced data (from GraphQL, not available in basic REST)
             'timeline_events': timeline_events,
             'commits': commits,
@@ -1476,10 +1544,16 @@ class GitHubDataSyncer:
         issues = []
         cursor = None
         total_fetched = 0
-        
+
         # Build the query with dynamic batch size
         query = self._build_issues_graphql_query(batch_size)
-        
+
+        # Time tracking for estimation
+        start_time = time.time()
+        last_update_time = start_time
+        requests_made = 0
+        total_count = None  # Will be set from first response
+
         self.status.print("🚀 Using GraphQL API for comprehensive issue fetching...", style="cyan")
         
         while True:
@@ -1497,6 +1571,7 @@ class GitHubDataSyncer:
             }
             
             try:
+                requests_made += 1
                 result = self._make_graphql_request(query, variables)
                 
                 repository = result.get('repository')
@@ -1504,7 +1579,11 @@ class GitHubDataSyncer:
                     raise Exception("Repository not found or not accessible")
                 
                 issues_data = repository['issues']
-                
+
+                # Capture total count from first response
+                if total_count is None:
+                    total_count = issues_data.get('totalCount', 0)
+
                 # Process issues
                 for issue_node in issues_data['nodes']:
                     # Transform GraphQL response to match REST API format
@@ -1519,8 +1598,39 @@ class GitHubDataSyncer:
                     break
                     
                 cursor = page_info['endCursor']
-                
-                self.status.update(f"📥 Fetched {total_fetched} issues via GraphQL (with timeline & commits)...")
+
+                # Calculate time estimation
+                current_time = time.time()
+                elapsed_time = current_time - start_time
+
+                # Only show estimation after we have some data points (2+ requests)
+                if requests_made >= 2 and total_fetched > 0:
+                    # Calculate rate
+                    issues_per_second = total_fetched / elapsed_time
+
+                    # Use the captured total count
+
+                    if total_count > 0 and issues_per_second > 0:
+                        remaining_issues = total_count - total_fetched
+                        estimated_seconds_remaining = remaining_issues / issues_per_second
+
+                        # Format time remaining
+                        if estimated_seconds_remaining < 60:
+                            time_str = f"{estimated_seconds_remaining:.0f}s"
+                        elif estimated_seconds_remaining < 3600:
+                            minutes = estimated_seconds_remaining / 60
+                            time_str = f"{minutes:.1f}m"
+                        else:
+                            hours = estimated_seconds_remaining / 3600
+                            time_str = f"{hours:.1f}h"
+
+                        progress_percent = (total_fetched / total_count) * 100
+
+                        self.status.update(f"📥 Fetched {total_fetched:,}/{total_count:,} issues ({progress_percent:.1f}%)", eta=f"ETA: {time_str}")
+                    else:
+                        self.status.update(f"📥 Fetched {total_fetched:,} issues via GraphQL (with timeline & commits)...")
+                else:
+                    self.status.update(f"📥 Fetched {total_fetched:,} issues via GraphQL (with timeline & commits)...")
                 
             except Exception as e:
                 error_message = str(e)
@@ -1623,7 +1733,7 @@ class GitHubDataSyncer:
         self.status.print(f"✅ Enriched {len([i for i in enriched_issues if i['project_data']])} issues with project data", style="green")
         return enriched_issues
     
-    def sync_issues_to_json(self, output_file: str, state: str = 'all', limit: Optional[int] = None, strategic_only: bool = True):
+    def sync_issues_to_json(self, output_file: str, state: str = 'all', limit: Optional[int] = None, strategic_only: bool = True, stale_after: int = 90):
         """Sync all GitHub issues data to a comprehensive JSON file using GraphQL API"""
         try:
             # Use GraphQL API - much more efficient than REST
@@ -1632,13 +1742,27 @@ class GitHubDataSyncer:
             if not issues:
                 print("No issues found in repository")
                 return
-            
+
+            # Apply stale issue filtering
+            if stale_after > 0:
+                self.status.update("🕒 Filtering stale issues...", style="yellow")
+                start_filter_time = time.time()
+                original_count = len(issues)
+                cutoff_date = datetime.now(timezone.utc) - timedelta(days=stale_after)
+                issues = [issue for issue in issues if self._is_issue_fresh(issue, cutoff_date)]
+                filtered_count = len(issues)
+                filter_time = time.time() - start_filter_time
+                self.status.print(f"🕒 Stale issue filter: syncing {filtered_count:,} recent issues (filtered out {original_count - filtered_count:,} stale issues older than {stale_after} days) [{filter_time:.1f}s]", style="blue")
+
             # Apply strategic work filtering if requested
             if strategic_only:
+                self.status.update("🎯 Applying strategic work filter...", style="yellow")
+                start_filter_time = time.time()
                 original_count = len(issues)
                 issues = [issue for issue in issues if is_strategic_work(issue)]
                 filtered_count = len(issues)
-                print(f"🎯 Strategic work focus: syncing {filtered_count:,} strategic issues (filtered out {original_count - filtered_count:,} operational tasks)")
+                filter_time = time.time() - start_filter_time
+                self.status.print(f"🎯 Strategic work focus: syncing {filtered_count:,} strategic issues (filtered out {original_count - filtered_count:,} operational tasks) [{filter_time:.1f}s]", style="blue")
             
             if not issues:
                 print("No issues found after filtering")
@@ -1657,7 +1781,8 @@ class GitHubDataSyncer:
                     'sync_date': datetime.now(timezone.utc).isoformat(),
                     'total_issues_synced': len(final_issues),
                     'strategic_work_filter': strategic_only,
-                    'state_filter': state
+                    'state_filter': state,
+                    'stale_filter_days': stale_after if stale_after > 0 else None
                 },
                 'issues': final_issues
             }
@@ -1703,6 +1828,7 @@ Cache Management:
     parser.add_argument('--state', choices=['open', 'closed', 'all'], default='all', help='Issue state filter (default: all)')
     parser.add_argument('--limit', type=int, help='Limit number of issues to sync (for debugging)')
     parser.add_argument('--no-strategic-filter', action='store_true', help='Include all issues, not just strategic work')
+    parser.add_argument('--stale-after', type=int, default=90, help='Filter out issues not updated in N days (default: 90)')
     parser.add_argument('--clear-cache', action='store_true', help='Clear cache for this repository and exit')
     parser.add_argument('--clear-all-caches', action='store_true', help='Clear all GitHub caches and exit')
     args = parser.parse_args()
@@ -1753,7 +1879,8 @@ Cache Management:
             output_file=args.output,
             state=args.state,
             limit=args.limit,
-            strategic_only=not args.no_strategic_filter
+            strategic_only=not args.no_strategic_filter,
+            stale_after=args.stale_after
         )
         
     except InterruptedException:

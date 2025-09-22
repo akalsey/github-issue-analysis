@@ -10,69 +10,206 @@ Focus on business impact, customer issues, and strategic initiatives
 #     "pandas",
 #     "openai",
 #     "python-dotenv",
+#     "pytz",
 # ]
 # ///
 
 import pandas as pd
 import re
 import os
+import hashlib
+import json
+import shutil
+import sys
+import time
 from collections import defaultdict
 from datetime import datetime
 from dotenv import load_dotenv
 from openai import OpenAI
 
-def is_strategic_work(issue_dict: dict) -> bool:
-    """
-    Filter for strategic business value work vs operational maintenance.
-    Same logic as cycle_time.py for consistency.
-    
-    INCLUDE: product work, features, customer issues, epics
-    EXCLUDE: chores, deployments, infrastructure, compliance tasks
-    """
-    labels_str = str(issue_dict.get('labels', '')).lower()
-    
-    # INCLUDE: Strategic business value work
-    include_patterns = [
-        'product/',      # All product work (voice, messaging, ai, video, etc.)
-        'epic',          # Major strategic initiatives
-        'area/customer', # Customer-impacting issues
-        'type/feature',  # New functionality/capabilities  
-        'type/bug',      # Customer-affecting defects
-    ]
-    
-    # EXCLUDE: Operational/maintenance work
-    exclude_patterns = [
-        'type/chore',     # Maintenance, deployments, cleanup
-        'dev/iac',        # Infrastructure as code
-        'deploy/',        # Deployment tasks
-        'compliance',     # Regulatory/security tasks
-        'tech-backlog',   # Technical debt
-        'status/',        # Workflow states, not deliverables
-        'area/internal',  # Internal tooling
-    ]
-    
-    # Check for exclusion patterns first (higher priority)
-    for pattern in exclude_patterns:
-        if pattern in labels_str:
-            return False
-    
-    # Check for inclusion patterns
-    for pattern in include_patterns:
-        if pattern in labels_str:
-            return True
-    
-    # Default: exclude unlabeled or unclear work
-    return False
+# Import configuration
+from config import (
+    CRITICAL_CUSTOMER_INDICATORS,
+    MAJOR_CUSTOMER_NAMES,
+    HIGH_PRIORITY_PATTERNS,
+    AI_ANALYSIS_TEMPERATURE,
+    AI_SUMMARY_CACHE_FILE,
+    get_openai_model,
+    validate_configuration
+)
+
+# Import shared utilities
+from utils_filtering import (
+    normalize_labels,
+    is_strategic_work,
+    is_scheduled_next_week,
+    is_critical_customer_issue,
+    is_work_in_progress
+)
+from utils_dates import (
+    is_recently_completed,
+    get_date_ranges,
+    get_week_boundaries
+)
+from utils import (
+    generate_issue_url,
+    get_issue_number,
+    format_labels_for_display,
+    format_status_emoji
+)
+
+def display_status_bar(current, total, description, eta_seconds=None, terminal_width=None):
+    """Display a progress status bar with description and optional ETA"""
+    if terminal_width is None:
+        terminal_width = shutil.get_terminal_size().columns
+
+    # Progress percentage
+    percentage = (current / total) * 100 if total > 0 else 0
+
+    # ETA formatting
+    eta_text = ""
+    if eta_seconds is not None and eta_seconds > 0:
+        if eta_seconds < 60:
+            eta_text = f" ETA: {eta_seconds:.0f}s"
+        elif eta_seconds < 3600:
+            eta_text = f" ETA: {eta_seconds/60:.1f}m"
+        else:
+            eta_text = f" ETA: {eta_seconds/3600:.1f}h"
+
+    # Status indicators
+    if percentage == 100:
+        status_icon = "✅"
+    elif current > 0:
+        status_icon = "🔄"
+    else:
+        status_icon = "⏳"
+
+    # Reserve space for percentage, counters, and ETA
+    reserved_space = len(f" {percentage:5.1f}% ({current}/{total}){eta_text}")
+    available_width = max(20, terminal_width - reserved_space - 4)  # 4 for icon and spacing
+
+    # Truncate description if needed
+    if len(description) > available_width:
+        description = description[:available_width-3] + "..."
+
+    # Calculate progress bar width (minimum 10 chars)
+    bar_width = max(10, available_width - len(description) - 1)
+    filled = int((current / total) * bar_width) if total > 0 else 0
+    bar = "█" * filled + "░" * (bar_width - filled)
+
+    # Build status line
+    status_line = f"\r{status_icon} {description} {bar} {percentage:5.1f}% ({current}/{total}){eta_text}"
+
+    # Ensure we don't exceed terminal width
+    if len(status_line) > terminal_width:
+        status_line = status_line[:terminal_width-1]
+
+    # Print with carriage return (overwrites current line)
+    print(status_line, end='', flush=True)
+
+    # Print newline when complete
+    if current >= total:
+        print()
+
+class AISummaryCache:
+    """Cache for AI-generated issue summaries based on content hash"""
+
+    def __init__(self, cache_file=AI_SUMMARY_CACHE_FILE):
+        self.cache_file = cache_file
+        self.cache = self._load_cache()
+
+    def _load_cache(self):
+        """Load cache from file"""
+        try:
+            if os.path.exists(self.cache_file):
+                with open(self.cache_file, 'r') as f:
+                    return json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"⚠️  Cache load error: {e}")
+        return {}
+
+    def _save_cache(self):
+        """Save cache to file"""
+        try:
+            with open(self.cache_file, 'w') as f:
+                json.dump(self.cache, f, indent=2)
+        except IOError as e:
+            print(f"⚠️  Cache save error: {e}")
+
+    def _get_content_hash(self, issue):
+        """Generate hash for issue content to detect changes"""
+        # Include key content that affects summary
+        content_parts = [
+            str(issue.get('number', '')),
+            issue.get('title', ''),
+            issue.get('body', '')[:500],  # First 500 chars of body
+            str(issue.get('labels', [])),
+            str(issue.get('state', '')),
+            str(issue.get('assignee', ''))
+        ]
+
+        # Include recent comments if available
+        comment_list = issue.get('comment_list', [])
+        if comment_list:
+            # Use last 2 comment bodies for hash
+            recent_comments = comment_list[-2:]
+            for comment in recent_comments:
+                if isinstance(comment, dict) and comment.get('body'):
+                    content_parts.append(comment['body'][:100])
+
+        content = '|'.join(content_parts)
+        return hashlib.md5(content.encode()).hexdigest()
+
+    def get_summary(self, issue):
+        """Get cached summary for issue if content hasn't changed"""
+        issue_number = str(issue.get('number', issue.get('issue_number', 'unknown')))
+        content_hash = self._get_content_hash(issue)
+
+        if issue_number in self.cache:
+            cached_entry = self.cache[issue_number]
+            if cached_entry.get('content_hash') == content_hash:
+                return cached_entry.get('summary')
+
+        return None
+
+    def set_summary(self, issue, summary):
+        """Cache summary for issue with content hash"""
+        issue_number = str(issue.get('number', issue.get('issue_number', 'unknown')))
+        content_hash = self._get_content_hash(issue)
+
+        self.cache[issue_number] = {
+            'summary': summary,
+            'content_hash': content_hash,
+            'generated_at': datetime.now().isoformat()
+        }
+
+        self._save_cache()
+
+# is_strategic_work moved to utils_filtering.py
 
 def categorize_issue(row):
     """Categorize issues by business priority and type"""
-    labels = str(row.labels).lower() if pd.notna(row.labels) else ""
+    # Handle both GraphQL format (labels as dicts with 'name') and REST format
+    raw_labels = row.labels
+    if isinstance(raw_labels, list) and len(raw_labels) > 0:
+        if isinstance(raw_labels[0], dict):
+            # GraphQL format: [{'name': 'product/ai'}, ...]
+            labels = ' '.join([label['name'].lower() for label in raw_labels])
+        else:
+            # List of strings
+            labels = ' '.join([str(label).lower() for label in raw_labels])
+    elif raw_labels is not None and not pd.isna(raw_labels):
+        # String or other format
+        labels = str(raw_labels).lower()
+    else:
+        labels = ""
+        
     title = str(row.title).lower()
     
     # Customer issues (highest priority)
     if any(x in labels for x in ['area/customer', 'revenue-impact', 'customer-escalation']):
         return 'customer'
-    if any(x in title for x in ['salesforce', 'sprinklr', 'daily', 'zoho']):
+    if any(x in title for x in MAJOR_CUSTOMER_NAMES):
         return 'customer'
     
     # Major features/epics - strategic initiatives
@@ -99,8 +236,13 @@ def categorize_issue(row):
 
 def get_work_status(row):
     """Determine work progress for executive reporting"""
-    has_assignee = pd.notna(row.assignee)
-    has_work_started = pd.notna(row.work_started_at)
+    has_assignee = pd.notna(row.assignee) if hasattr(row, 'assignee') else False
+    has_work_started = pd.notna(row.work_started_at) if hasattr(row, 'work_started_at') else False
+    
+    # For GraphQL data, also check if assignees list is not empty
+    if not has_assignee and hasattr(row, 'assignees'):
+        if isinstance(row.assignees, list) and len(row.assignees) > 0:
+            has_assignee = True
     
     if has_assignee and has_work_started:
         return 'active'  # Work in progress
@@ -109,44 +251,265 @@ def get_work_status(row):
     else:
         return 'planned'  # Not yet started
 
-def analyze_issue_with_ai(client, issue, category):
+
+def analyze_issue_with_ai(client, issue, category, cache=None):
     """Use OpenAI to analyze issue and generate detailed executive summary"""
     if not client:
         return None
-        
+
+    # Check cache first
+    if cache:
+        cached_summary = cache.get_summary(issue)
+        if cached_summary:
+            return cached_summary
+
     title = issue.get('title', '')
-    labels = str(issue.get('labels', ''))
+    # Handle both GraphQL and REST label formats
+    raw_labels = issue.get('labels', [])
+    if isinstance(raw_labels, list) and raw_labels and isinstance(raw_labels[0], dict):
+        labels = ' '.join([label['name'] for label in raw_labels])
+    else:
+        labels = str(raw_labels)
+
     assignee = issue.get('assignee', 'Unassigned')
-    
+    state = issue.get('state', 'unknown')
+
+    # Get truncated issue body
+    body = issue.get('body', '')
+    # Truncate very long bodies to avoid token limits
+    if len(body) > 1000:
+        body = body[:1000] + "...[truncated]"
+
+    # Check qualification reasons for context
+    qualification_reasons = issue.get('qualification_reason', [])
+    context = ""
+    if 'recently_completed' in qualification_reasons:
+        context = "This issue was recently completed."
+    elif 'scheduled_next_week' in qualification_reasons:
+        context = "This issue is scheduled for next week or currently in development."
+    elif 'critical_customer' in qualification_reasons:
+        context = "This is a critical customer issue."
+
+    # Get recent comments for customer issues and bugs
+    comments_context = ""
+    if ('area/customer' in labels.lower() or 'type/bug' in labels.lower()):
+        # First try to get from comment_list (new format with actual content)
+        comment_list = issue.get('comment_list', [])
+        if comment_list:
+            recent_comments = comment_list[-4:]  # Last 4 comments
+            comment_texts = []
+            for comment in recent_comments:
+                if isinstance(comment, dict) and comment.get('body'):
+                    comment_body = comment['body'][:200]  # Last 4 comments, 200 chars each
+                    # Clean up common noise in comments
+                    if not any(noise in comment_body.lower() for noise in ['cc @', '/cc @', 'thanks!', 'thank you']):
+                        comment_texts.append(comment_body)
+            if comment_texts:
+                comments_context = f"\n\nRecent comments: {' | '.join(comment_texts)}"
+        elif issue.get('comments', 0) > 0:
+            # Fallback: if comments is just a count, note that there are comments but we don't have the content
+            comments_context = f"\n\nNote: This issue has {issue.get('comments')} comments (content not available in current data)"
+
     prompt = f"""
-Analyze this GitHub issue for an executive briefing. Provide a terse 1-2 sentence summary explaining WHAT the issue is:
+Write a terse 1-2 sentence summary. Be direct and factual. Do NOT start with "This issue" or similar phrases.
 
+Title: {title}
 Labels: {labels}
-Category: {category}
-Assignee: {assignee}
+Status: {state}
 
-Write 1-2 sentences maximum explaining:
-- WHAT problem/situation this addresses (the actual issue/bug/feature)
-- WHAT needs to be fixed/built/changed
+Description: {body}{comments_context}
 
-Be concise and direct. Describe the problem or deliverable, not why it matters. Do NOT repeat the issue title. Use business language but focus on describing the actual issue.
+State the problem/bug/feature directly. Include specific technical details if available.
 
-Format: 1-2 complete sentences, plain text.
+Examples:
+BAD: "This issue addresses a critical bug where calls disconnect after one hour"
+GOOD: "Critical bug where calls disconnect after one hour. Websocket connection closing due to suspected customer VPN network issues."
+
+Format: Direct facts, 1-2 sentences maximum.
 """
-    
+
     try:
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5-nano",
             messages=[
                 {"role": "system", "content": "You are a senior business analyst writing detailed executive briefings on technical projects. Your audience is C-level executives who need to understand business impact, strategic value, and risks. Focus on business outcomes, customer impact, revenue implications, and competitive positioning."},
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=100,
-            temperature=0.3
+            max_completion_tokens=200,
+            reasoning_effort="low"
+        )
+        summary = response.choices[0].message.content.strip()
+
+        # Cache the new summary
+        if cache:
+            cache.set_summary(issue, summary)
+
+        return summary
+    except Exception as e:
+        error_message = str(e)
+        issue_num = issue.get('number', issue.get('issue_number', 'unknown'))
+        print(f"AI analysis failed for issue {issue_num}: {error_message}")
+
+        # If it's a token limit error, try again with much shorter content
+        if 'max_tokens' in error_message.lower() or 'output limit' in error_message.lower():
+            try:
+                print(f"Retrying issue {issue_num} with truncated content...")
+                # Create a much shorter prompt for problematic issues
+                short_prompt = f"""
+Write a terse 1-2 sentence summary. Be direct and factual. Do NOT start with "This issue" or similar phrases.
+
+Title: {title}
+Labels: {labels}
+Status: {state}
+
+Brief description: {body[:300]}...
+
+State the problem/bug/feature directly.
+"""
+                response = client.chat.completions.create(
+                    model="gpt-5-nano",
+                    messages=[
+                        {"role": "system", "content": "You are a business analyst writing concise technical summaries."},
+                        {"role": "user", "content": short_prompt}
+                    ],
+                    max_completion_tokens=100,
+                    reasoning_effort="low"
+                )
+                summary = response.choices[0].message.content.strip()
+
+                # Cache the fallback summary
+                if cache:
+                    cache.set_summary(issue, summary)
+
+                print(f"Successfully generated fallback summary for issue {issue_num}")
+                return summary
+            except Exception as fallback_error:
+                print(f"Fallback AI analysis also failed for issue {issue_num}: {fallback_error}")
+                return None
+
+        return None
+
+def group_issues_by_topic_areas(client, issues):
+    """Group issues by major topic areas using AI"""
+    if not client or not issues:
+        return None
+
+    try:
+        # Prepare issue data for AI analysis
+        issue_data = []
+        for issue in issues:
+            issue_info = {
+                'number': issue.get('number', issue.get('issue_number')),
+                'title': issue.get('title', ''),
+                'labels': issue.get('labels', [])
+            }
+            # Extract label names if they're objects
+            if isinstance(issue_info['labels'], list) and issue_info['labels'] and isinstance(issue_info['labels'][0], dict):
+                issue_info['labels'] = [label['name'] for label in issue_info['labels']]
+            issue_data.append(issue_info)
+
+        prompt = f"""Analyze these {len(issues)} issues and group them by major topic areas. Create 3-6 high-level topic groups that capture the main themes. Each group should contain multiple related issues.
+
+Issues to analyze:
+{chr(10).join([f"#{item['number']}: {item['title']} (labels: {', '.join(item['labels']) if item['labels'] else 'none'})" for item in issue_data])}
+
+Return a JSON object with this structure:
+{{
+  "topic_groups": [
+    {{
+      "topic_name": "Clear topic name (e.g., 'WhatsApp Messaging Features')",
+      "description": "Brief description of what this group covers",
+      "issue_numbers": [list of issue numbers in this group],
+      "summary": "One sentence summary of the work in this area"
+    }}
+  ]
+}}
+
+Focus on major functional areas like messaging, calling, onboarding, infrastructure, etc. Group related technical details under broader themes."""
+
+        response = client.chat.completions.create(
+            model="gpt-5",
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        import json
+        result = json.loads(response.choices[0].message.content)
+        return result.get('topic_groups', [])
+
+    except Exception as e:
+        print(f"⚠️  Topic grouping failed: {e}")
+        return None
+
+def generate_backlog_summary_with_ai(client, all_issues, qualifying_issues):
+    """Generate executive summary of product backlog themes"""
+    if not client:
+        return None
+
+    # Get issues that weren't already included in the main report
+    qualifying_issue_numbers = set(str(issue.get('number', issue.get('issue_number', ''))) for issue in qualifying_issues)
+    backlog_issues = [issue for issue in all_issues
+                     if str(issue.get('number', issue.get('issue_number', ''))) not in qualifying_issue_numbers]
+
+    if not backlog_issues:
+        return None
+
+    # Limit to prevent overly long prompts - sample representative issues
+    sample_size = min(50, len(backlog_issues))
+    sample_issues = backlog_issues[:sample_size]
+
+    # Create summary of issue titles and labels for analysis
+    issue_summaries = []
+    for issue in sample_issues:
+        title = issue.get('title', 'Untitled')
+
+        # Handle both GraphQL and REST label formats
+        raw_labels = issue.get('labels', [])
+        if isinstance(raw_labels, list) and raw_labels and isinstance(raw_labels[0], dict):
+            labels = ', '.join([label['name'] for label in raw_labels])
+        else:
+            labels = str(raw_labels) if raw_labels else 'No labels'
+
+        issue_summaries.append(f"- {title} ({labels})")
+
+    issues_text = '\n'.join(issue_summaries)
+
+    prompt = f"""
+Analyze this product backlog and provide a one-paragraph executive summary for a product executive briefing.
+
+BACKLOG CONTEXT:
+- Total backlog size: {len(backlog_issues)} strategic issues
+- Sample of {len(sample_issues)} representative issues shown below
+- These are issues NOT included in the main status report (not recently completed, not scheduled next week, not critical customer issues)
+
+SAMPLE ISSUES:
+{issues_text}
+
+INSTRUCTIONS:
+Write ONE comprehensive paragraph (4-6 sentences) that identifies the major themes and strategic initiatives in this product backlog. Focus on:
+
+1. Key product areas and capabilities being developed
+2. Major strategic themes or initiatives
+3. Technical platform investments
+4. Overall portfolio balance (features vs bugs vs infrastructure)
+
+Use executive language suitable for C-level briefings. Don't list individual issues - instead synthesize the major patterns and strategic directions.
+
+Format: One paragraph, plain text.
+"""
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-5-nano",
+            messages=[
+                {"role": "system", "content": "You are a senior product strategist writing executive briefings on product roadmaps. Your audience is C-level executives who need to understand strategic direction, resource allocation, and competitive positioning."},
+                {"role": "user", "content": prompt}
+            ],
+            max_completion_tokens=300,
+            reasoning_effort="low"
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
-        print(f"AI analysis failed for issue {issue.get('issue_number', 'unknown')}: {e}")
+        print(f"Backlog summary generation failed: {e}")
         return None
 
 def analyze_group_with_ai(client, group_name, issues, category):
@@ -176,13 +539,13 @@ Format: 1-2 complete sentences, plain text.
     
     try:
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5-nano",
             messages=[
                 {"role": "system", "content": "You are a strategic business analyst providing executive briefings on product development themes. Focus on business outcomes, competitive positioning, and strategic value."},
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=100,
-            temperature=0.3
+            max_completion_tokens=150,
+            reasoning_effort="low"
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
@@ -195,16 +558,23 @@ def group_issues_intelligently(issues, client=None):
     
     for issue in issues:
         title = issue.get('title', '').lower()
-        labels = str(issue.get('labels', '')).lower()
+        # Handle both GraphQL and REST label formats
+        raw_labels = issue.get('labels', [])
+        if isinstance(raw_labels, list) and raw_labels and isinstance(raw_labels[0], dict):
+            labels = ' '.join([label['name'].lower() for label in raw_labels])
+        else:
+            labels = str(raw_labels).lower()
         
         # Smart grouping based on business themes
-        if any(x in title for x in ['salesforce', 'sprinklr']):
+        if any(x in title for x in MAJOR_CUSTOMER_NAMES):
             if 'salesforce' in title:
                 groups['Salesforce Customer Issues'].append(issue)
-            else:
+            elif 'sprinklr' in title:
                 groups['Sprinklr Customer Issues'].append(issue)
-        elif any(x in title for x in ['daily']):
-            groups['Daily Customer Platform Issues'].append(issue)
+            elif 'daily' in title:
+                groups['Daily Customer Platform Issues'].append(issue)
+            else:
+                groups['Other Customer Issues'].append(issue)
         elif any(x in title for x in ['fabric', 'calling api']):
             groups['Fabric Integration Platform'].append(issue)
         elif any(x in title for x in ['ai agent', 'swml']):
@@ -255,34 +625,112 @@ This comprehensive analysis covers **{total_issues:,} strategic initiatives** cu
 **EXECUTIVE ATTENTION REQUIRED:**
 {"🚨 **CRITICAL**: " + str(customer_planned) + " customer issues lack engineering assignment - immediate revenue risk" if customer_planned > 0 else "✅ All customer-critical issues have assigned engineering resources"}"""
 
-def main():
+
+
+
+
+# is_recently_completed moved to utils_dates.py
+
+# is_scheduled_next_week moved to utils_filtering.py
+
+# is_critical_customer_issue moved to utils_filtering.py
+
+def get_issue_type_priority(issue_dict: dict) -> int:
+    """Get numeric priority for sorting issues by type (lower number = higher priority)."""
+    # Handle both GraphQL and REST label formats
+    raw_labels = issue_dict.get('labels', [])
+    if isinstance(raw_labels, list) and raw_labels and isinstance(raw_labels[0], dict):
+        labels_str = ' '.join([label['name'].lower() for label in raw_labels])
+    else:
+        labels_str = str(raw_labels).lower()
+
+    title = issue_dict.get('title', '').lower()
+
+    # Priority order: Lower number = higher priority
+    if 'epic' in labels_str:
+        return 1  # Epic - Major strategic initiatives
+    elif 'type/feature' in labels_str:
+        return 2  # Feature - New functionality/capabilities
+    elif any(pattern in labels_str for pattern in ['product/ai', 'product/voice', 'product/video', 'product/messaging']):
+        return 2  # Product features
+    elif 'type/bug' in labels_str or 'bug' in title:
+        return 3  # Bug - Customer-affecting defects
+    elif any(pattern in labels_str for pattern in ['type/chore', 'deploy/', 'maintenance']):
+        return 4  # Chore - Maintenance, deployments, cleanup
+    elif any(pattern in labels_str for pattern in ['dev/iac', 'infrastructure', 'platform']):
+        return 5  # Infrastructure - Platform/infrastructure work
+    elif any(pattern in labels_str for pattern in ['compliance', 'security', 'tech-backlog']):
+        return 4  # Technical work
+    else:
+        return 6  # Other - Default fallback
+
+def get_issue_type_emoji(issue_dict: dict) -> str:
+    """Determine the emoji representing the issue type."""
+    # Handle both GraphQL and REST label formats
+    raw_labels = issue_dict.get('labels', [])
+    if isinstance(raw_labels, list) and raw_labels and isinstance(raw_labels[0], dict):
+        labels_str = ' '.join([label['name'].lower() for label in raw_labels])
+    else:
+        labels_str = str(raw_labels).lower()
+
+    title = issue_dict.get('title', '').lower()
+
+    # Priority order: Features/Epics first, then Bugs, then operational work
+    if 'epic' in labels_str:
+        return "🚀"  # Epic - Major strategic initiatives
+    elif 'type/feature' in labels_str:
+        return "✨"  # Feature - New functionality/capabilities
+    elif any(pattern in labels_str for pattern in ['product/ai', 'product/voice', 'product/video', 'product/messaging']):
+        return "✨"  # Product features
+    elif 'type/bug' in labels_str or 'bug' in title:
+        return "🐛"  # Bug - Customer-affecting defects
+    elif any(pattern in labels_str for pattern in ['type/chore', 'deploy/', 'maintenance']):
+        return "🔧"  # Chore - Maintenance, deployments, cleanup
+    elif any(pattern in labels_str for pattern in ['dev/iac', 'infrastructure', 'platform']):
+        return "🏗️"  # Infrastructure - Platform/infrastructure work
+    elif any(pattern in labels_str for pattern in ['compliance', 'security', 'tech-backlog']):
+        return "🔧"  # Technical work
+    else:
+        return "📋"  # Other - Default fallback
+
+# is_work_in_progress moved to utils_filtering.py
+
+def parse_arguments():
+    """Parse command line arguments."""
     import argparse
-    
-    parser = argparse.ArgumentParser(description="Generate executive product status report from cycle time data")
-    parser.add_argument('json_file', nargs='?', default='cycle_time_report/cycle_time_data.json', 
+
+    parser = argparse.ArgumentParser(description="Generate executive product status report with completed, scheduled, and critical issues")
+    parser.add_argument('json_file', nargs='?', default='cycle_time_report/cycle_time_data.json',
                        help='JSON file with issues data (default: cycle_time_report/cycle_time_data.json)')
-    args = parser.parse_args()
-    
-    # Load environment and setup OpenAI
+    return parser.parse_args()
+
+
+def setup_environment():
+    """Setup environment and OpenAI client."""
     load_dotenv()
     openai_api_key = os.getenv('OPENAI_API_KEY')
     client = None
+
     if openai_api_key:
         client = OpenAI(api_key=openai_api_key)
         print("🤖 OpenAI enabled for intelligent issue analysis")
     else:
         print("⚠️  OPENAI_API_KEY not set - using basic categorization only")
-    
-    # Load the data - try JSON first for repository metadata, fallback to CSV
+
+    return client
+
+
+def load_data(json_file):
+    """Load issue data from JSON file."""
     json_data = None
     github_owner = None
     github_repo = None
-    
-    if os.path.exists(args.json_file):
+
+    if os.path.exists(json_file):
         import json as json_module
-        with open(args.json_file, 'r') as f:
+        with open(json_file, 'r') as f:
             json_data = json_module.load(f)
-            
+
         # Check if we have the new JSON structure with metadata
         if 'repository' in json_data and 'issues' in json_data:
             github_owner = json_data['repository'].get('github_owner')
@@ -297,256 +745,400 @@ def main():
         df = pd.read_csv('cycle_time_report/cycle_time_data.csv')
         print("⚠️  Using CSV data - GitHub URLs will need to be inferred or hardcoded")
     else:
-        print(f"❌ Error: {args.json_file} not found")
-        print("Run 'uv run cycle_time.py <json_file>' first to generate data")
-        return
-    
-    open_df = df[df.state == 'open'].copy()
-    
-    # Apply strategic work filtering (always enabled)
-    original_count = len(open_df)
-    # Convert DataFrame rows to dictionaries for filtering
-    strategic_issues = []
-    for _, row in open_df.iterrows():
+        raise FileNotFoundError(f"❌ Error: {json_file} not found. Run 'uv run cycle_time.py <json_file>' first to generate data")
+
+    return df, github_owner, github_repo
+
+
+def process_issues(df):
+    """Process and categorize issues into qualifying categories."""
+    print(f"📋 Processing {len(df)} total issues...")
+    qualifying_issues = []
+    all_strategic_issues = []  # Track all strategic issues for backlog summary
+    completed_count = 0
+    scheduled_count = 0
+    critical_count = 0
+    strategic_count = 0
+
+    for i, (_, row) in enumerate(df.iterrows()):
+        # Update status bar every 100 issues
+        if i % 100 == 0:
+            display_status_bar(i, len(df), "Processing issues for strategic work filtering")
+
         issue_dict = row.to_dict()
-        if is_strategic_work(issue_dict):
-            strategic_issues.append(issue_dict)
-    
-    if strategic_issues:
-        open_df = pd.DataFrame(strategic_issues)
-        filtered_count = len(open_df)
-        print(f"🎯 Strategic work focus: analyzing {filtered_count:,} strategic issues (filtered out {original_count - filtered_count:,} operational tasks)")
-    else:
-        print("❌ No strategic work issues found after filtering")
-        return
-    
-    print(f"📊 Analyzing {len(open_df):,} open issues for executive product status report...")
-    
-    # Add categorization
-    open_df['category'] = open_df.apply(categorize_issue, axis=1)
-    open_df['work_status'] = open_df.apply(get_work_status, axis=1)
-    
-    # Group and analyze by category
-    categories = {}
-    for category in ['customer', 'feature', 'platform', 'product', 'bugs', 'other']:
-        cat_issues = open_df[open_df.category == category]
-        if len(cat_issues) > 0:
-            categories[category] = {
-                'total': len(cat_issues),
-                'active': len(cat_issues[cat_issues.work_status == 'active']),
-                'started': len(cat_issues[cat_issues.work_status == 'started']),
-                'planned': len(cat_issues[cat_issues.work_status == 'planned']),
-                'issues': cat_issues.to_dict('records')
-            }
-    
-    # Print summary
-    print("\n=== CATEGORY BREAKDOWN ===")
-    for cat, data in categories.items():
-        print(f"{cat.upper()}: {data['total']} issues (Active: {data['active']}, Planned: {data['planned']})")
-    
-    # Generate report
-    current_date = datetime.now().strftime("%B %d, %Y")
-    repo_display = f"{github_owner}/{github_repo}"
-    
-    report_lines = []
-    report_lines.append("# Product Management Status Report - Everything Not Deployed")
-    report_lines.append("")
-    report_lines.append(f"**Repository:** {repo_display}")
-    report_lines.append(f"**Analysis Date:** {current_date}")
-    report_lines.append(f"**Total Open Issues:** {len(open_df):,}")
-    report_lines.append("**Scope:** All incomplete work requiring deployment")
-    report_lines.append("")
-    report_lines.append("---")
-    report_lines.append("")
-    report_lines.append("## Executive Summary")
-    report_lines.append("")
-    report_lines.append(generate_executive_summary(categories, len(open_df)))
-    report_lines.append("")
-    report_lines.append("---")
-    report_lines.append("")
-    
-    footnotes = []
-    
-    # Work in Progress Section
-    report_lines.append("## 🚨 **WORK IN PROGRESS** - Started But Not Finished")
-    report_lines.append("")
-    
-    active_categories = ['customer', 'feature', 'platform']
-    for category in active_categories:
-        if category not in categories:
+
+        # Apply strategic work filtering first
+        if not is_strategic_work(issue_dict):
             continue
-            
-        data = categories[category]
-        active_issues = [issue for issue in data['issues'] if issue['work_status'] == 'active']
-        
-        if not active_issues:
-            continue
-            
-        category_title = {
-            'customer': 'Critical Customer Issues',
-            'feature': 'Major Product Initiatives', 
-            'platform': 'Platform Infrastructure'
-        }[category]
-        
-        report_lines.append(f"### **{category_title}** ({len(active_issues)} Active)")
-        report_lines.append("")
-        
-        # Group issues intelligently
-        issue_groups = group_issues_intelligently(active_issues[:15], client)  # Limit for readability
-        
-        for group_name, group_issues in issue_groups.items():
-            if not group_issues:
+
+        strategic_count += 1
+        all_strategic_issues.append(issue_dict)  # Collect all strategic issues
+
+        # Check if issue qualifies for any of the three categories
+        is_completed = is_recently_completed(issue_dict)
+        is_scheduled = is_scheduled_next_week(issue_dict)
+        is_critical = is_critical_customer_issue(issue_dict)
+
+        if is_completed or is_scheduled or is_critical:
+            issue_dict['qualification_reason'] = []
+            if is_completed:
+                issue_dict['qualification_reason'].append('recently_completed')
+                completed_count += 1
+            if is_scheduled:
+                issue_dict['qualification_reason'].append('scheduled_next_week')
+                scheduled_count += 1
+            if is_critical:
+                issue_dict['qualification_reason'].append('critical_customer')
+                critical_count += 1
+            qualifying_issues.append(issue_dict)
+
+    # Final status bar update for processing
+    display_status_bar(len(df), len(df), "Issue processing complete")
+
+    print(f"🎯 Filtering complete:")
+    print(f"   • {strategic_count} strategic issues (out of {len(df)} total)")
+    print(f"   • {len(qualifying_issues)} qualifying issues found")
+
+    if not qualifying_issues:
+        raise ValueError("❌ No issues found matching criteria (completed, scheduled, or critical)")
+
+    print(f"📊 Breakdown of {len(qualifying_issues)} qualifying issues:")
+    print(f"   • {completed_count} recently completed (last 7 days)")
+    print(f"   • {scheduled_count} scheduled for next week")
+    print(f"   • {critical_count} critical customer issues")
+
+    return {
+        'qualifying_issues': qualifying_issues,
+        'all_strategic_issues': all_strategic_issues,
+        'counts': {
+            'completed': completed_count,
+            'scheduled': scheduled_count,
+            'critical': critical_count,
+            'strategic': strategic_count
+        }
+    }
+
+
+def generate_ai_summaries(client, qualifying_issues):
+    """Generate AI summaries for qualifying issues with caching."""
+    cache = AISummaryCache() if client else None
+
+    if not client:
+        print("\n⚠️  OpenAI API key not set - skipping AI summaries")
+        for issue in qualifying_issues:
+            issue['ai_summary'] = None
+        return None
+
+    print(f"\n🤖 Generating AI summaries for {len(qualifying_issues)} issues...")
+    cached_count = 0
+    generated_count = 0
+    start_time = time.time()
+
+    for i, issue in enumerate(qualifying_issues):
+        issue_num = issue.get('number', issue.get('issue_number', 'unknown'))
+
+        # Calculate ETA
+        elapsed_time = time.time() - start_time
+        if i > 0:
+            avg_time_per_issue = elapsed_time / i
+            remaining_issues = len(qualifying_issues) - i
+            eta_seconds = avg_time_per_issue * remaining_issues
+        else:
+            eta_seconds = None
+
+        # Display progress with status bar including cache miss percentage
+        total_processed = cached_count + generated_count
+        cache_miss_pct = (generated_count / total_processed * 100) if total_processed > 0 else 0
+        display_status_bar(i, len(qualifying_issues), f"Generating AI summaries for issue #{issue_num} (cache miss: {cache_miss_pct:.0f}%)", eta_seconds)
+
+        # Check if we have a cached summary first
+        if cache:
+            cached_summary = cache.get_summary(issue)
+            if cached_summary:
+                issue['ai_summary'] = cached_summary
+                cached_count += 1
                 continue
-                
-            report_lines.append(f"#### **{group_name}**")
-            
-            # Add AI-generated group analysis for executive context
-            if client:
-                group_analysis = analyze_group_with_ai(client, group_name, group_issues, category)
-                if group_analysis:
-                    report_lines.append("")
-                    report_lines.append(f"*{group_analysis}*")
-                    report_lines.append("")
-            
+
+        # Generate new summary
+        summary = analyze_issue_with_ai(client, issue, 'executive', cache)
+        issue['ai_summary'] = summary
+        if summary:
+            generated_count += 1
+
+    # Final status bar update with final cache miss percentage
+    total_processed = cached_count + generated_count
+    cache_miss_pct = (generated_count / total_processed * 100) if total_processed > 0 else 0
+    display_status_bar(len(qualifying_issues), len(qualifying_issues), f"AI summary generation complete (cache miss: {cache_miss_pct:.0f}%)")
+    print(f"📋 Cache stats: {cached_count} cached, {generated_count} newly generated")
+
+    # Generate backlog summary of remaining issues
+    print(f"\n🎯 Generating product backlog summary...")
+    return generate_backlog_summary_with_ai(client, qualifying_issues, qualifying_issues)
+
+
+def generate_executive_summary(client, issues, time_period="this period"):
+    """Generate executive summary grouped by topic areas"""
+    if not client or not issues:
+        return f"No issues to summarize for {time_period}."
+
+    try:
+        # Prepare issue data for AI analysis
+        issues_text = []
+        for issue in issues:
+            labels = issue.get('labels', [])
+            if isinstance(labels, list) and labels and isinstance(labels[0], dict):
+                labels_str = ', '.join([label['name'] for label in labels])
+            else:
+                labels_str = str(labels) if labels else ''
+
+            issues_text.append(f"#{issue.get('number', 'N/A')}: {issue.get('title', 'Untitled')} (Labels: {labels_str})")
+
+        prompt = f"""You are analyzing GitHub issues for an executive product status report. Create a factual, analytical summary grouped by major topic areas (e.g., Voice & Calling Infrastructure, WhatsApp Integration, Platform APIs, etc.).
+
+For each topic area, provide:
+1. A clear topic heading (###)
+2. 2-3 sentences stating what was accomplished and its business impact
+3. Use objective language - describe capabilities, fixes, and improvements without promotional language
+4. Avoid time references ("this week", "we did") - focus on what was accomplished
+5. Focus on customer impact, system reliability, and operational capabilities
+
+Issues to analyze:
+{chr(10).join(issues_text)}
+
+Format as markdown with ### headings for each topic area. Be factual and analytical, not promotional. Describe the work and its business impact objectively. If there are only 1-2 issues, create a single paragraph summary instead of topic sections."""
+
+        response = client.chat.completions.create(
+            model="gpt-5",
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        return response.choices[0].message.content.strip()
+
+    except Exception as e:
+        return f"Unable to generate executive summary for {time_period}: {str(e)}"
+
+
+def generate_reports(qualifying_issues, all_strategic_issues, counts, client, github_owner, github_repo):
+    """Generate both main and customer reports."""
+    # Categorize issues by type
+    completed_issues = [i for i in qualifying_issues if 'recently_completed' in i['qualification_reason']]
+    scheduled_issues = [i for i in qualifying_issues if 'scheduled_next_week' in i['qualification_reason']]
+    critical_issues = [i for i in qualifying_issues if 'critical_customer' in i['qualification_reason']]
+
+    # Generate AI summaries first
+    backlog_summary = generate_ai_summaries(client, qualifying_issues)
+
+    # Generate the main report content
+    current_date = datetime.now().strftime("%Y-%m-%d")
+    repo_display = f"{github_owner}/{github_repo}" if github_owner and github_repo else "Repository"
+
+    report_lines = []
+    report_lines.append("# Executive Product Status Report")
+    report_lines.append("")
+    report_lines.append(f"**Repository:** {repo_display}   ")
+    report_lines.append(f"**Report Date:** {current_date}   ")
+    report_lines.append(f"**Strategic Issues Analyzed:** {counts['strategic']}")
+    report_lines.append("")
+
+    report_lines.append("**Scope:** Recently Completed, Scheduled Next Week, and Critical Customer Issues")
+    report_lines.append("")
+    report_lines.append("## 📊 **EXECUTIVE SUMMARY**")
+    report_lines.append("")
+    report_lines.append(f"- **{counts['completed']} issues** completed in the last 7 days")
+    report_lines.append(f"- **{counts['scheduled']} issues** scheduled for next week")
+    report_lines.append(f"- **{counts['critical']} critical customer issues** requiring attention (see `customer_issues.md`)")
+    report_lines.append("")
+
+    # Generate and add executive summaries for completed and planned work
+    if completed_issues and client:
+        print("🎯 Generating executive summary for completed work...")
+        completed_summary = generate_executive_summary(client, completed_issues, "last week")
+        report_lines.append("## 🏆 **LAST WEEK'S ACHIEVEMENTS**")
+        report_lines.append("")
+        report_lines.append(completed_summary)
+        report_lines.append("")
+
+    if scheduled_issues and client:
+        print("🎯 Generating executive summary for planned work...")
+        planned_summary = generate_executive_summary(client, scheduled_issues, "this week")
+        report_lines.append("## 🎯 **THIS WEEK'S PLANNED WORK**")
+        report_lines.append("")
+        report_lines.append(planned_summary)
+        report_lines.append("")
+
+    footnotes = []
+
+    # Helper functions for report building
+    def add_issue_section_with_topics(title, emoji, issues, topic_groups, status_description=""):
+        """Add a section grouped by topic areas"""
+        if not issues or not topic_groups:
+            return
+
+        report_lines.append(f"## {emoji} **{title}**")
+        if status_description:
+            report_lines.append(f"*{status_description}*")
+        report_lines.append("")
+
+        # Create issue lookup
+        issue_lookup = {issue.get('number', issue.get('issue_number')): issue for issue in issues}
+
+        # Group issues that weren't categorized
+        categorized_numbers = set()
+        for group in topic_groups:
+            categorized_numbers.update(group.get('issue_numbers', []))
+
+        for group in topic_groups:
+            topic_name = group.get('topic_name', 'Unknown Topic')
+            description = group.get('description', '')
+            summary = group.get('summary', '')
+            issue_numbers = group.get('issue_numbers', [])
+
+            if not issue_numbers:
+                continue
+
+            report_lines.append(f"### 🎯 **{topic_name}**")
+            if description:
+                report_lines.append(f"*{description}*")
             report_lines.append("")
-            
-            for issue in group_issues[:10]:  # Limit per group
-                assignee_text = f" ({issue['assignee']})" if pd.notna(issue['assignee']) else ""
-                labels_str = str(issue.get('labels', '')).lower()
-                
-                # Priority indicators
-                priority = ""
-                if 'revenue-impact' in labels_str or 'escalated' in labels_str:
-                    priority = " - ESCALATED"
-                elif 'p1' in labels_str:
-                    priority = " - P1"
-                
-                report_lines.append(f"🔄 **{issue['title']}**[^{issue['issue_number']}]{assignee_text}{priority}")
-                
-                # AI-generated analysis if available
-                if client:
-                    analysis = analyze_issue_with_ai(client, issue, category)
-                    if analysis:
-                        # Format as indented paragraphs for readability
-                        report_lines.append("")
-                        # Split into paragraphs and format
-                        paragraphs = analysis.split('\n\n') if '\n\n' in analysis else [analysis]
-                        for paragraph in paragraphs:
-                            if paragraph.strip():
-                                # Wrap long paragraphs
-                                wrapped_paragraph = paragraph.strip()
-                                report_lines.append(f"   *{wrapped_paragraph}*")
-                        report_lines.append("")
-                else:
-                    # Fallback without AI - add basic context
-                    labels_display = issue.get('labels', '').replace(',', ', ') if issue.get('labels') else 'No labels'
-                    report_lines.append(f"   *Labels: {labels_display}*")
-                    report_lines.append("")
-                
+
+            if summary:
+                report_lines.append(f"**Summary:** {summary}")
                 report_lines.append("")
-                
-                # Add footnote with dynamic URL
+
+            # Get issues for this topic and sort by type priority
+            topic_issues = [issue_lookup[num] for num in issue_numbers if num in issue_lookup]
+            sorted_topic_issues = sorted(topic_issues, key=get_issue_type_priority)
+
+            # List all issues in this topic with footnotes
+            footnote_refs = []
+            for issue in sorted_topic_issues:
+                issue_num = issue.get('number', issue.get('issue_number'))
+                title = issue.get('title', 'Untitled')
+                footnote_refs.append(f"[^{issue_num}]")
+
+                # Add footnote
                 if 'github_issue_url' in issue:
-                    # Use URL from JSON data
                     issue_url = issue['github_issue_url']
                 elif github_owner and github_repo:
-                    # Generate URL from repository metadata
-                    issue_url = f"https://github.com/{github_owner}/{github_repo}/issues/{issue['issue_number']}"
-                
-                footnotes.append(f"[^{issue['issue_number']}]: {issue_url} - {issue['title']}")
-    
-    # Planned Work Section
-    report_lines.append("---")
-    report_lines.append("")
-    report_lines.append("## 📋 **PLANNED WORK** - Not Yet Started")
-    report_lines.append("")
-    
-    for category in active_categories:
-        if category not in categories:
-            continue
-            
-        data = categories[category]
-        planned_issues = [issue for issue in data['issues'] if issue['work_status'] == 'planned']
-        
-        if not planned_issues:
-            continue
-            
-        category_title = {
-            'customer': 'Customer Issues Requiring Assignment',
-            'feature': 'Major Feature Development',
-            'platform': 'Platform Infrastructure'
-        }[category]
-        
-        report_lines.append(f"### **{category_title}** ({len(planned_issues)} Planned)")
-        report_lines.append("")
-        
-        # Group and show top planned work
-        issue_groups = group_issues_intelligently(planned_issues[:10], client)
-        
-        for group_name, group_issues in list(issue_groups.items())[:3]:  # Top 3 groups
-            if not group_issues:
-                continue
-                
-            report_lines.append(f"#### **{group_name}**")
-            for issue in group_issues[:5]:  # Top 5 per group
-                report_lines.append(f"📋 **{issue['title']}**[^{issue['issue_number']}]")
-                
-                # Add footnote with dynamic URL
+                    issue_url = f"https://github.com/{github_owner}/{github_repo}/issues/{issue_num}"
+                else:
+                    issue_url = f"Issue #{issue_num}"
+
+                footnotes.append(f"[^{issue_num}]: {issue_url} - {title}")
+
+            if footnote_refs:
+                report_lines.append(f"**Issues:** {', '.join(footnote_refs)}")
+            report_lines.append("")
+
+        # Add any uncategorized issues
+        uncategorized = [issue for issue in issues
+                        if issue.get('number', issue.get('issue_number')) not in categorized_numbers]
+
+        if uncategorized:
+            report_lines.append("### 📋 **Other Items**")
+            report_lines.append("")
+
+            # Sort uncategorized issues by type priority
+            sorted_uncategorized = sorted(uncategorized, key=get_issue_type_priority)
+
+            footnote_refs = []
+            for issue in sorted_uncategorized:
+                issue_num = issue.get('number', issue.get('issue_number'))
+                title = issue.get('title', 'Untitled')
+                footnote_refs.append(f"[^{issue_num}]")
+
+                # Add footnote
                 if 'github_issue_url' in issue:
                     issue_url = issue['github_issue_url']
-                else github_owner and github_repo:
-                    issue_url = f"https://github.com/{github_owner}/{github_repo}/issues/{issue['issue_number']}"
-                
-                footnotes.append(f"[^{issue['issue_number']}]: {issue_url} - {issue['title']}")
+                elif github_owner and github_repo:
+                    issue_url = f"https://github.com/{github_owner}/{github_repo}/issues/{issue_num}"
+                else:
+                    issue_url = f"Issue #{issue_num}"
+
+                footnotes.append(f"[^{issue_num}]: {issue_url} - {title}")
+
+            if footnote_refs:
+                report_lines.append(f"**Issues:** {', '.join(footnote_refs)}")
             report_lines.append("")
-    
-    # Strategic recommendations
+
+    def add_issue_section(title, emoji, issues, status_description=""):
+        """Helper to add a section for a specific type of issue"""
+        if not issues:
+            return
+
+        # Sort issues by type priority (epics and features first, then bugs)
+        sorted_issues = sorted(issues, key=get_issue_type_priority)
+
+        report_lines.append(f"## {emoji} **{title}**")
+        if status_description:
+            report_lines.append(f"*{status_description}*")
+        report_lines.append("")
+        for issue in sorted_issues:
+            issue_num = issue.get('number', issue.get('issue_number'))
+            title = issue.get('title', 'Untitled')
+            # Issue type indicator
+            type_emoji = get_issue_type_emoji(issue)
+
+            report_lines.append(f"{type_emoji} **{title}**[^{issue_num}]")
+            report_lines.append("")
+
+            # Add AI summary if available
+            if issue.get('ai_summary'):
+                report_lines.append(f"   {issue['ai_summary']}")
+            else:
+                # Fallback description
+                raw_labels = issue.get('labels', [])
+                if isinstance(raw_labels, list) and raw_labels and isinstance(raw_labels[0], dict):
+                    labels_display = ', '.join([label['name'] for label in raw_labels])
+                else:
+                    labels_display = str(raw_labels).replace(',', ', ') if raw_labels else 'No labels'
+                report_lines.append(f"   *Labels: {labels_display}*")
+
+            report_lines.append("")
+
+            # Add footnote
+            if 'github_issue_url' in issue:
+                issue_url = issue['github_issue_url']
+            elif github_owner and github_repo:
+                issue_url = f"https://github.com/{github_owner}/{github_repo}/issues/{issue_num}"
+            else:
+                issue_url = f"Issue #{issue_num}"
+
+            footnotes.append(f"[^{issue_num}]: {issue_url} - {title}")
+
+    # Add detailed sections header
     report_lines.append("---")
     report_lines.append("")
-    report_lines.append("## 🎯 **EXECUTIVE ACTION PLAN**")
+    report_lines.append("## 📋 **DETAILED ISSUE BREAKDOWN**")
     report_lines.append("")
-    
-    customer_active = categories.get('customer', {}).get('active', 0)
-    customer_planned = categories.get('customer', {}).get('planned', 0)
-    feature_planned = categories.get('feature', {}).get('planned', 0)
-    total_planned = sum(cat.get('planned', 0) for cat in categories.values())
-    
-    report_lines.append("### **IMMEDIATE ACTIONS (Next 7 Days)**")
-    report_lines.append("")
-    
-    if customer_planned > 0:
-        report_lines.append("**🚨 CRITICAL CUSTOMER ESCALATION**")
-        report_lines.append(f"- **{customer_planned} revenue-impacting customer issues have no assigned engineering resources**")
-        report_lines.append("- **Business Risk**: Direct customer churn, revenue loss, and competitive disadvantage")
-        report_lines.append("- **Required Action**: Executive intervention to immediately assign senior engineering resources")
-        report_lines.append("- **Timeline**: Assignment required within 48 hours to prevent customer escalation")
+
+    # Add the main sections (excluding customer issues)
+    add_issue_section("RECENTLY COMPLETED", "✅", completed_issues,
+                     "Issues that were completed in the last 7 days")
+
+    # Handle scheduled issues with topic grouping
+    if scheduled_issues:
+        topic_groups = group_issues_by_topic_areas(client, scheduled_issues) if client else None
+
+        if topic_groups:
+            add_issue_section_with_topics("SCHEDULED FOR NEXT WEEK", "📅", scheduled_issues, topic_groups,
+                                        "Issues with milestones or labels indicating next week delivery")
+        else:
+            add_issue_section("SCHEDULED FOR NEXT WEEK", "📅", scheduled_issues,
+                             "Issues with milestones or labels indicating next week delivery")
+
+    # Add product backlog summary
+    if backlog_summary:
+        remaining_count = len(all_strategic_issues) - len(qualifying_issues)
+        report_lines.append("---")
         report_lines.append("")
-    
-    if total_planned > 0:
-        report_lines.append("**📋 RESOURCE ALLOCATION CRISIS**")
-        report_lines.append(f"- **{total_planned} strategic initiatives lack engineering assignment**")
-        report_lines.append("- **Business Impact**: Delayed product roadmap, missed competitive opportunities, reduced market position")
-        report_lines.append("- **Root Cause Analysis Required**: Resource planning, hiring velocity, or prioritization breakdown")
+        report_lines.append("## 📚 **PRODUCT BACKLOG OVERVIEW**")
         report_lines.append("")
-    
-    report_lines.append("### **STRATEGIC INTERVENTIONS (Next 30 Days)**")
-    report_lines.append("")
-    report_lines.append("**1. Engineering Capacity Analysis**")
-    report_lines.append("   - Conduct immediate audit of engineering workload distribution")
-    report_lines.append("   - Identify over-allocated engineers and potential reassignment opportunities")
-    report_lines.append("   - Evaluate contractor/consulting engagement for critical customer issues")
-    report_lines.append("")
-    report_lines.append("**2. Product Roadmap Prioritization**")
-    report_lines.append("   - Executive committee review of strategic initiative prioritization")
-    report_lines.append("   - Revenue impact analysis for delayed features vs customer issues")
-    report_lines.append("   - Competitive risk assessment for delayed market initiatives")
-    report_lines.append("")
-    report_lines.append("**3. Process Improvement**")
-    report_lines.append("   - Implement automated alerts for unassigned customer-critical issues")
-    report_lines.append("   - Establish executive escalation protocols for resource allocation failures")
-    report_lines.append("   - Create weekly executive dashboard for strategic work progress tracking")
-    report_lines.append("")
-    
+        report_lines.append(f"*Analysis of {remaining_count} strategic issues not included in the above categories*")
+        report_lines.append("")
+        report_lines.append(backlog_summary)
+        report_lines.append("")
+
     # Add footnotes
     if footnotes:
         report_lines.append("---")
@@ -555,17 +1147,118 @@ def main():
         report_lines.append("")
         for footnote in footnotes:
             report_lines.append(footnote)
-    
-    # Write report
+
+    # Generate customer report
+    customer_report_lines = []
+    customer_footnotes = []
+
+    if critical_issues:
+        customer_report_lines.append("# Critical Customer Issues Report")
+        customer_report_lines.append("")
+        customer_report_lines.append(f"**Repository:** {repo_display}   ")
+        customer_report_lines.append(f"**Report Date:** {current_date}   ")
+        customer_report_lines.append(f"**Total Critical Customer Issues:** {len(critical_issues)}")
+        customer_report_lines.append("")
+        customer_report_lines.append("---")
+        customer_report_lines.append("")
+        customer_report_lines.append("## 🚨 **CRITICAL CUSTOMER ISSUES**")
+        customer_report_lines.append("*High-priority customer-impacting issues requiring immediate attention*")
+        customer_report_lines.append("")
+
+        # Sort critical issues by type priority
+        sorted_critical_issues = sorted(critical_issues, key=get_issue_type_priority)
+
+        for issue in sorted_critical_issues:
+            issue_num = issue.get('number', issue.get('issue_number'))
+            title = issue.get('title', 'Untitled')
+            # Issue type indicator
+            type_emoji = get_issue_type_emoji(issue)
+
+            customer_report_lines.append(f"{type_emoji} **{title}**[^{issue_num}]")
+            customer_report_lines.append("")
+
+            # Add AI summary if available
+            if issue.get('ai_summary'):
+                customer_report_lines.append(f"   {issue['ai_summary']}")
+            else:
+                # Fallback description
+                raw_labels = issue.get('labels', [])
+                if isinstance(raw_labels, list) and raw_labels and isinstance(raw_labels[0], dict):
+                    labels_display = ', '.join([label['name'] for label in raw_labels])
+                else:
+                    labels_display = str(raw_labels).replace(',', ', ') if raw_labels else 'No labels'
+                customer_report_lines.append(f"   *Labels: {labels_display}*")
+
+            customer_report_lines.append("")
+
+            # Add footnote
+            if 'github_issue_url' in issue:
+                issue_url = issue['github_issue_url']
+            elif github_owner and github_repo:
+                issue_url = f"https://github.com/{github_owner}/{github_repo}/issues/{issue_num}"
+            else:
+                issue_url = f"Issue #{issue_num}"
+
+            customer_footnotes.append(f"[^{issue_num}]: {issue_url} - {title}")
+
+        # Add customer footnotes
+        if customer_footnotes:
+            customer_report_lines.append("---")
+            customer_report_lines.append("")
+            customer_report_lines.append("## Footnotes")
+            customer_report_lines.append("")
+            customer_report_lines.extend(customer_footnotes)
+
+    return {
+        'main_report': '\n'.join(report_lines),
+        'customer_report': '\n'.join(customer_report_lines) if critical_issues else None,
+        'counts': counts,
+        'footnotes_count': len(footnotes),
+        'critical_issues_count': len(critical_issues)
+    }
+
+
+def main():
+    args = parse_arguments()
+    client = setup_environment()
+
+    # Load issue data
+    try:
+        df, github_owner, github_repo = load_data(args.json_file)
+    except FileNotFoundError as e:
+        print(e)
+        return
+
+    # Process and categorize issues
+    try:
+        results = process_issues(df)
+        qualifying_issues = results['qualifying_issues']
+        all_strategic_issues = results['all_strategic_issues']
+        counts = results['counts']
+    except ValueError as e:
+        print(e)
+        return
+
+    # Generate reports
+    reports = generate_reports(qualifying_issues, all_strategic_issues, counts, client, github_owner, github_repo)
+
+    # Write reports to files
     os.makedirs('reports', exist_ok=True)
-    
+
     with open('reports/product_management_status.md', 'w') as f:
-        f.write('\n'.join(report_lines))
-    
+        f.write(reports['main_report'])
+
+    if reports['customer_report']:
+        with open('reports/customer_issues.md', 'w') as f:
+            f.write(reports['customer_report'])
+        print(f"\n✅ Customer issues report written to reports/customer_issues.md")
+        print(f"🚨 Included {reports['critical_issues_count']} critical customer issues")
+
     print(f"\n✅ Executive report written to reports/product_management_status.md")
-    print(f"📝 Included {len(footnotes)} issue references with footnotes")
+    print(f"📝 Included {reports['footnotes_count']} issue references with footnotes")
     if client:
         print("🤖 AI-powered analysis included for business impact assessment")
+
 
 if __name__ == "__main__":
     main()
